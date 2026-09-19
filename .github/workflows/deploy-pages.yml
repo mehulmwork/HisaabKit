@@ -1,0 +1,48 @@
+name: Deploy HisabKit to GitHub Pages
+
+# HisabKit is a single self-contained index.html — there is no build step.
+# The repository root IS the production output, so it is uploaded as-is.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Required for the official GitHub Pages deployment actions.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel a run that is mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Verify the entry point exists
+        run: |
+          test -f index.html || { echo "::error::index.html is missing — nothing to deploy"; exit 1; }
+          echo "Deploying index.html ($(wc -c < index.html) bytes)"
+
+      - name: Upload site as a Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

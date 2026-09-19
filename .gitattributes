@@ -1,0 +1,14 @@
+# Normalise line endings to LF in the repository AND in the working tree.
+# Without this, Windows' core.autocrlf rewrites the deployed index.html to CRLF,
+# so what GitHub Pages serves would differ from what was tested locally.
+* text=auto eol=lf
+
+# Binary assets should never be line-ending converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary

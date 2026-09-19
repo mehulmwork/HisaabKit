@@ -1,0 +1,34 @@
+# ---- Dependencies / build output (not used by this project, ignored defensively) ----
+node_modules/
+dist/
+build/
+out/
+.next/
+.cache/
+
+# ---- Environment / secrets ----
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets.json
+
+# ---- Logs ----
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# ---- Editor / OS cruft ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+
+# ---- Local-only task briefs (not part of the shipped application) ----
+Prompt.txt
+
+# NOTE: index.html, README.md, .nojekyll and .github/ MUST stay tracked —
+# they are the deployed site. Do not ignore them.
