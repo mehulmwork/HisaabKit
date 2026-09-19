@@ -694,6 +694,26 @@ const ADJUSTMENT_TYPES = ['Stock In','Stock Out','Damage','Correction'];
 
 const LEDGER_TYPES = ['Purchase','Sale','Return','Adjustment','Damage','Correction'];
 
+/**
+ * Google Apps Script Web App that fronts the HisabKit "Items" sheet.
+ *
+ * GET  -> { success: true, items: [ {ItemID, SKU, ...}, ... ] }
+ * POST -> one item object, using the exact sheet column names below.
+ *
+ * Apps Script answers a JSON content-type POST with an OPTIONS preflight that
+ * carries no Access-Control-Allow-Origin, so the POST is sent as text/plain
+ * instead — that stays a CORS "simple request" and skips the preflight.
+ */
+const API_CONFIG = {
+  url: 'https://script.google.com/macros/s/AKfycbyec-wwxV5FTw7Hgn9vRv4kgi9NVC3jUyiZ76gluK7hG9BaMDBSggp1iOxcn-9MIURt/exec',
+  timeoutMs: 12000
+};
+
+/** The sheet's columns, in order — the wire contract for GET and POST. */
+const SHEET_COLUMNS = ['ItemID','SKU','ItemName','Category','Unit',
+                       'PurchasePrice','SellingPrice','CurrentStock',
+                       'LowStockLevel','Status'];
+
 const DEFAULT_CATEGORIES = [
   'Copper Pipes','Refrigerant','Insulation','AC Parts',
   'Electrical','Tools','Accessories','Consumables'
@@ -723,6 +743,7 @@ const state = {
   // UI state (not persisted)
   route: 'inventory',
   sidebarCollapsed: false,
+  apiOnline: false,     // true once the Google Sheet has answered
   inventory: {
     search: '', category: '', stockStatus: '', supplier: '',
     sortKey: 'sku', sortDir: 'asc',
@@ -887,7 +908,7 @@ function brandMark() {
 }
 
 /* ============================================================
-   4. PERSISTENCE
+   4. PERSISTENCE — localStorage, plus the Google Sheets API
    ============================================================ */
 function loadData() {
   try {
@@ -1219,6 +1240,241 @@ function seedDemoData() {
   });
 
   saveData();
+}
+
+/* ---- Google Sheets API — the Items sheet ------------------------------
+   When the sheet is reachable it is the source of truth for Inventory;
+   localStorage stays the fallback when it is not. Only Items are synced —
+   parties, purchases, sales and the ledger remain local for now.
+   Field mapping (sheet -> app): ItemID->id, SKU->sku, ItemName->name,
+   Category->category, Unit->unit, PurchasePrice->purchasePrice,
+   SellingPrice->sellingPrice, CurrentStock->currentStock,
+   LowStockLevel->lowStockLevel, Status->sheetStatus.
+   ---------------------------------------------------------------------- */
+
+/** fetch() with an abort timeout, so a hung API cannot stall the app. */
+function apiFetch(url, options) {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const opts = Object.assign({}, options);
+  if (controller) opts.signal = controller.signal;
+  const timer = setTimeout(() => { if (controller) controller.abort(); }, API_CONFIG.timeoutMs);
+  return fetch(url, opts).then(
+    res => { clearTimeout(timer); return res; },
+    err => { clearTimeout(timer); throw err; }
+  );
+}
+
+/** One Google Sheet row -> one HisabKit item record. */
+function sheetRowToItem(row) {
+  const text = v => String(v === null || v === undefined ? '' : v).trim();
+  const stock = round2(row.CurrentStock) || 0;
+  return {
+    id:            text(row.ItemID),
+    sku:           text(row.SKU),
+    name:          text(row.ItemName),
+    category:      text(row.Category),
+    unit:          text(row.Unit) || 'Piece',
+    purchasePrice: round2(row.PurchasePrice) || 0,
+    sellingPrice:  round2(row.SellingPrice) || 0,
+    currentStock:  stock,
+    openingStock:  stock,
+    lowStockLevel: round2(row.LowStockLevel) || 0,
+    sheetStatus:   text(row.Status),
+    source:        'sheet',
+    // The sheet has no column for these — filled from the local record or defaults.
+    brand: '', gstRate: 0, supplierId: '', description: '',
+    createdAt: todayISO(), updatedAt: todayISO()
+  };
+}
+
+/** One HisabKit item -> one Google Sheet row, using the exact column names. */
+function itemToSheetRow(item) {
+  const values = {
+    ItemID:        item.id,
+    SKU:           item.sku || '',
+    ItemName:      item.name || '',
+    Category:      item.category || '',
+    Unit:          item.unit || '',
+    PurchasePrice: Number(item.purchasePrice) || 0,
+    SellingPrice:  Number(item.sellingPrice) || 0,
+    CurrentStock:  Number(item.currentStock) || 0,
+    LowStockLevel: Number(item.lowStockLevel) || 0,
+    Status:        item.sheetStatus || 'Active'
+  };
+  const row = {};
+  SHEET_COLUMNS.forEach(col => { row[col] = values[col]; });
+  return row;
+}
+
+/** GET every item. Throws on any failure so callers can fall back. */
+async function apiGetItems() {
+  console.log('[HisabKit API] GET started — ' + API_CONFIG.url);
+
+  let res;
+  try {
+    const sep = API_CONFIG.url.indexOf('?') === -1 ? '?' : '&';
+    res = await apiFetch(API_CONFIG.url + sep + '_=' + Date.now(), {
+      method: 'GET',
+      redirect: 'follow',
+      cache: 'no-store'
+    });
+  } catch (err) {
+    console.error('[HisabKit API] GET failed — network/timeout error:', err);
+    throw err;
+  }
+
+  if (!res.ok) {
+    const err = new Error('HTTP ' + res.status + ' ' + res.statusText);
+    console.error('[HisabKit API] GET failed —', err.message);
+    throw err;
+  }
+
+  let data;
+  try {
+    data = await res.json();
+  } catch (err) {
+    console.error('[HisabKit API] GET failed — response was not valid JSON:', err);
+    throw err;
+  }
+
+  if (!data || data.success !== true || !Array.isArray(data.items)) {
+    const err = new Error('Unexpected response shape: ' + JSON.stringify(data).slice(0, 200));
+    console.error('[HisabKit API] GET failed —', err.message);
+    throw err;
+  }
+
+  console.log('[HisabKit API] GET successful — ' + data.items.length + ' item(s) received');
+  return data.items;
+}
+
+/** POST one new item. Throws on any failure so callers can fall back. */
+async function apiPostItem(row) {
+  console.log('[HisabKit API] POST started — ' + row.ItemID + ' (' + row.ItemName + ')');
+
+  let res;
+  try {
+    res = await apiFetch(API_CONFIG.url, {
+      method: 'POST',
+      // text/plain, not application/json: Apps Script does not answer the
+      // CORS preflight, so a JSON content-type would be blocked by the browser.
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(row),
+      redirect: 'follow'
+    });
+  } catch (err) {
+    console.error('[HisabKit API] POST failed — network/timeout error:', err);
+    throw err;
+  }
+
+  if (!res.ok) {
+    const err = new Error('HTTP ' + res.status + ' ' + res.statusText);
+    console.error('[HisabKit API] POST failed —', err.message);
+    throw err;
+  }
+
+  const body = await res.text();
+  let data = null;
+  try { data = body ? JSON.parse(body) : null; } catch (err) { data = null; }
+
+  if (data && data.success === false) {
+    const err = new Error(data.error || data.message || 'The API reported failure');
+    console.error('[HisabKit API] POST failed —', err.message);
+    throw err;
+  }
+
+  console.log('[HisabKit API] POST successful — ' + row.ItemID + ' written to the sheet');
+  return data || { success: true };
+}
+
+/**
+ * Replace the local inventory with the sheet's rows.
+ * De-duplicates on ItemID, preserves the app-only fields of items we already
+ * know, and gives each newly imported item an opening ledger row so that
+ * recalculateAllBalances() reconciles to the sheet's CurrentStock rather than
+ * forcing it to zero.
+ */
+function applySheetItems(rows) {
+  const seen = Object.create(null);
+  const incoming = [];
+
+  rows.forEach(row => {
+    const item = sheetRowToItem(row);
+    if (!item.id || !item.name) return;   // skip blank or partial rows
+    if (seen[item.id]) return;            // never import the same ItemID twice
+    seen[item.id] = true;
+    incoming.push(item);
+  });
+
+  // Items created while the sheet was unreachable are not in the sheet yet.
+  // Hold on to them so the user's entry is never silently dropped.
+  const pendingLocals = state.items.filter(i => i.pendingSync);
+
+  const localById = Object.create(null);
+  state.items.forEach(i => { localById[i.id] = i; });
+
+  state.items = incoming.map(item => {
+    const local = localById[item.id];
+    if (!local) return item;              // brand new from the sheet
+    return Object.assign({}, item, {      // known item: keep the local-only fields
+      brand: local.brand || '',
+      gstRate: local.gstRate || 0,
+      supplierId: local.supplierId || '',
+      description: local.description || '',
+      createdAt: local.createdAt || item.createdAt
+    });
+  });
+
+  // Re-attach the unsynced items. They are absent from the sheet, so this
+  // cannot produce a duplicate.
+  pendingLocals.forEach(p => {
+    if (!state.items.some(i => i.id === p.id)) state.items.push(p);
+  });
+
+  state.items.forEach(item => {
+    const hasHistory = state.ledger.some(l => l.itemId === item.id);
+    if (!hasHistory && item.currentStock > 0) {
+      createLedgerEntry({
+        itemId: item.id,
+        date: todayISO(),
+        reference: 'OPENING',
+        type: 'Adjustment',
+        quantityIn: item.currentStock,
+        quantityOut: 0,
+        reason: 'Opening stock imported from Google Sheet'
+      });
+    }
+  });
+}
+
+/**
+ * Load Items from the sheet into state.
+ * Returns true when the sheet answered and became the source of inventory,
+ * false when it could not be reached (local data is then left untouched).
+ */
+async function loadItemsFromApi() {
+  let rows;
+  try {
+    rows = await apiGetItems();
+  } catch (err) {
+    state.apiOnline = false;
+    showToast('Google Sheet unavailable — using saved local data.', 'error');
+    return false;
+  }
+
+  if (!rows.length && state.items.length) {
+    // A successful-but-empty read is not "real data" — keep what we have
+    // rather than wiping the catalogue.
+    console.warn('[HisabKit API] GET returned 0 items — keeping the ' +
+                 state.items.length + ' item(s) already stored locally');
+    state.apiOnline = true;
+    return true;
+  }
+
+  state.apiOnline = true;
+  applySheetItems(rows);
+  saveData();
+  await pushPendingItems();          // self-heal anything created while offline
+  return true;
 }
 /* ============================================================
    5. TOAST NOTIFICATIONS
@@ -2549,16 +2805,108 @@ function submitItemForm(form, itemId) {
     showToast('Quantity cannot be negative', 'error'); return;
   }
 
+  // Editing stays local for now — this phase of the API defines GET and POST only.
   if (itemId) {
     updateItem(itemId, data);
     showToast('Item updated successfully');
-  } else {
-    saveItem(data);
-    showToast('Item added successfully');
+    closeModal();
+    render();
+    return;
   }
 
-  closeModal();
-  render();
+  addItemViaApi(form, data);
+}
+
+/**
+ * Add New Item: POST to the Google Sheet, then re-read Inventory from it.
+ * localStorage is written only when the POST fails, so the sheet stays the
+ * source of truth whenever it is reachable.
+ */
+async function addItemViaApi(form, data) {
+  const submitBtn = form.querySelector('button[type="submit"]');
+  if (submitBtn) submitBtn.disabled = true;
+
+  // (a) a unique ItemID, and (b) the row in the sheet's exact column names
+  const row = itemToSheetRow({
+    id: generateId('itm'),
+    sku: data.sku,
+    name: data.name,
+    category: data.category,
+    unit: data.unit,
+    purchasePrice: data.purchasePrice,
+    sellingPrice: data.sellingPrice,
+    currentStock: round2(data.openingStock) || 0,
+    lowStockLevel: data.lowStockLevel,
+    sheetStatus: 'Active'
+  });
+
+  try {
+    await apiPostItem(row);              // (c) POST it
+
+    const refreshed = await loadItemsFromApi();   // (d) re-read Inventory
+
+    if (!refreshed) {
+      // The write landed but the re-read did not. Keep it visible under the
+      // SAME ItemID so a later GET replaces it instead of duplicating it.
+      keepPostedItemLocally(row);
+    }
+
+    closeModal();
+    render();
+    showToast('Item added successfully');        // (e) success message
+  } catch (err) {
+    // (f) POST failed — fall back to localStorage so the entry is not lost.
+    // Flagged so the next successful load can push it up and it is never
+    // mistaken for a sheet row.
+    const item = saveItem(data);
+    item.source = 'local';
+    item.pendingSync = true;
+    saveData();
+
+    closeModal();
+    render();
+    showToast('Google Sheet unreachable — item saved on this device only.', 'error');
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+}
+
+/** Keep a successfully POSTed item visible when the follow-up GET failed. */
+function keepPostedItemLocally(row) {
+  const item = sheetRowToItem(row);
+  if (state.items.some(i => i.id === item.id)) return;
+  state.items.push(item);
+  if (item.currentStock > 0) {
+    createLedgerEntry({
+      itemId: item.id,
+      date: todayISO(),
+      reference: 'OPENING',
+      type: 'Adjustment',
+      quantityIn: item.currentStock,
+      quantityOut: 0,
+      reason: 'Opening stock imported from Google Sheet'
+    });
+  }
+  saveData();
+}
+
+/** Push up any items that were created while the sheet was unreachable. */
+async function pushPendingItems() {
+  const pending = state.items.filter(i => i.pendingSync);
+  if (!pending.length) return;
+
+  console.log('[HisabKit API] retrying ' + pending.length + ' item(s) saved while offline');
+  for (const item of pending) {
+    try {
+      await apiPostItem(itemToSheetRow(item));
+      delete item.pendingSync;
+      delete item.source;
+    } catch (err) {
+      console.warn('[HisabKit API] still offline — ' + item.id + ' remains unsynced');
+      break;                                  // still down; try again next load
+    }
+  }
+  saveData();
 }
 
 /** Read-only detail view with recent stock movements. */
@@ -5026,14 +5374,8 @@ function bindGlobalEvents() {
    10. INITIALISATION
    ============================================================ */
 
-function init() {
+async function init() {
   loadData();
-
-  // First launch (or erased data): seed the demo dataset
-  if (!state.items.length && !localStorage.getItem(STORAGE_KEYS.items)) {
-    seedDemoData();
-    loadData();
-  }
 
   // Make sure every item's stock agrees with its ledger, and that the
   // ledger's running balances are internally consistent.
@@ -5042,14 +5384,38 @@ function init() {
   // Honour the collapsed-sidebar preference on small screens
   if (window.innerWidth <= 900) state.sidebarCollapsed = true;
 
+  // Paint immediately from localStorage so the app is never blank, then
+  // reconcile with the Google Sheet.
   renderSidebar();
   renderTopbar();
   document.getElementById('main').classList.toggle('collapsed', state.sidebarCollapsed);
   render();
   bindGlobalEvents();
+
+  const fromApi = await loadItemsFromApi();
+
+  if (fromApi) {
+    recalculateAllBalances();
+    renderSidebar();
+    render();
+    return;
+  }
+
+  // Sheet unreachable: fall back to localStorage, seeding the demo dataset
+  // only on a genuine first visit. Demo data is never mixed with real rows.
+  if (!state.items.length && !localStorage.getItem(STORAGE_KEYS.items)) {
+    seedDemoData();
+    loadData();
+    recalculateAllBalances();
+    renderSidebar();
+    render();
+  }
 }
 
-document.addEventListener('DOMContentLoaded', init);
+// init() is async because it waits on the sheet; never let a rejection escape.
+document.addEventListener('DOMContentLoaded', () => {
+  init().catch(err => console.error('HisabKit: initialisation failed', err));
+});
 </script>
 </body>
 </html>

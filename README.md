@@ -10,7 +10,9 @@ PURCHASE  →  STOCK IN  →  INVENTORY  →  SALE  →  STOCK OUT  →  STOCK L
 ```
 
 This is a **Phase 1 prototype**. It is a single self-contained `index.html` with no
-backend, no build step and no dependencies — open it and it runs.
+build step and no dependencies — open it and it runs. Inventory is synced with a
+Google Sheet through a Google Apps Script Web App; everything else stays in the
+browser's `localStorage`.
 
 ---
 
@@ -20,8 +22,10 @@ backend, no build step and no dependencies — open it and it runs.
 
 Repository: **https://github.com/mehulmwork/HisaabKit**
 
-The site is public. It is a purely front-end application: all data lives in your
-browser's `localStorage`, so nothing is uploaded anywhere and no login is required.
+The site is public and needs no login. Inventory items are read from and written to
+a Google Sheet, so the item list is shared between everyone who opens the site;
+parties, purchases, sales, the stock ledger and settings live only in your own
+browser's `localStorage`.
 
 ---
 
@@ -62,7 +66,7 @@ No install, no build, no server required.
 ```
 
 That's it. Because there are no external asset references, it also works fine when
-opened directly from the filesystem via `file://`.
+opened directly from the filesystem via `file://` — the Google Sheets sync included.
 
 If you prefer to serve it over HTTP:
 
@@ -70,14 +74,37 @@ If you prefer to serve it over HTTP:
 python -m http.server 8000     # then open http://localhost:8000
 ```
 
+### Google Sheets sync
+
+The **Items** sheet is the source of truth for Inventory whenever the Apps Script
+Web App is reachable. On startup the app calls it, and the Inventory table shows
+the sheet's rows. Adding an item posts it to the sheet and then re-reads the list,
+so what you see always came back from Google.
+
+If the API cannot be reached, the app falls back to the last known items held in
+`localStorage` and says so. An item added while the sheet is unreachable is kept on
+that device and pushed to the sheet automatically on the next successful load.
+
+Two things are deliberately local-only for now: **editing** and **deleting** an
+item, because this phase of the API defines only GET and POST. An edit or delete
+changes your browser's copy and will be overwritten the next time the sheet is read.
+
+The endpoint is configured by `API_CONFIG.url` near the top of the script in
+`index.html`. Requests are sent as `text/plain` rather than `application/json` —
+Apps Script does not answer the CORS preflight, so a JSON content-type would be
+rejected by the browser.
+
 ### Demo data
 
-On first launch the app seeds realistic demo data — 24 inventory items, 10 suppliers,
-12 customers, 12 purchase bills, 16 sales invoices and ~94 stock ledger entries —
-covering an AC and refrigeration trading business.
+If the sheet is unreachable on a first visit, the app seeds realistic demo data —
+24 inventory items, 10 suppliers, 12 customers, 12 purchase bills, 16 sales invoices
+and ~94 stock ledger entries — covering an AC and refrigeration trading business.
 
-Seeding happens **once**. It is stored in `localStorage` and is not re-created on
-refresh, so your changes persist. To start over, use **Settings → Reset demo data**.
+When the Google Sheet answers, **no demo data is created** and none of it is mixed
+with the sheet's rows.
+
+Seeding happens **once**, and is stored in `localStorage`. To start over, use
+**Settings → Reset demo data**.
 
 ---
 
@@ -122,6 +149,18 @@ tables later. Persisted under `localStorage` keys:
 `hisabkit_items`, `hisabkit_suppliers`, `hisabkit_customers`, `hisabkit_purchases`,
 `hisabkit_sales`, `hisabkit_stock_ledger`, `hisabkit_settings`.
 
+`hisabkit_items` acts as the offline cache of the **Items** sheet. The sheet's
+columns map onto the item record as: `ItemID`→`id`, `SKU`→`sku`, `ItemName`→`name`,
+`Category`→`category`, `Unit`→`unit`, `PurchasePrice`→`purchasePrice`,
+`SellingPrice`→`sellingPrice`, `CurrentStock`→`currentStock`,
+`LowStockLevel`→`lowStockLevel`, `Status`→`sheetStatus`. The app has no column of
+its own for brand, GST rate, supplier or description, so those are kept locally and
+preserved across syncs.
+
+The Inventory badge is **derived** from stock levels (`In Stock` / `Low Stock` /
+`Out of Stock`), not read from the sheet's `Status` column — that value is stored on
+the item as `sheetStatus` but is not displayed.
+
 ---
 
 ## Deployment
@@ -146,6 +185,8 @@ dropped on whole amounts. Dates display as `DD/MM/YYYY`.
 
 ## Not in this phase
 
-Deliberately out of scope for Phase 1: backend, database, authentication, real GST
-invoices, PDF generation, barcode scanning, batch/serial numbers, multiple warehouses,
-returns, and full accounting. The data model is kept compatible with adding them.
+Deliberately out of scope for Phase 1: users and authentication, real GST invoices,
+PDF generation, barcode scanning, batch/serial numbers, multiple warehouses, returns,
+and full accounting. Only the **Items** sheet is wired up so far — parties, purchases,
+sales and the ledger are not yet synced to Google Sheets. The data model is kept
+compatible with adding them.
