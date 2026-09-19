@@ -32,6 +32,10 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          # Create the Pages site if it does not exist yet, so the very first
+          # run cannot fail with "Pages is not enabled".
+          enablement: true
 
       - name: Verify the entry point exists
         run: |
