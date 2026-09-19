@@ -16,9 +16,9 @@ backend, no build step and no dependencies — open it and it runs.
 
 ## Live site
 
-**https://mehulmwork.github.io/hisabkit/**
+**https://mehulmwork.github.io/HisaabKit/**
 
-Repository: **https://github.com/mehulmwork/hisabkit**
+Repository: **https://github.com/mehulmwork/HisaabKit**
 
 The site is public. It is a purely front-end application: all data lives in your
 browser's `localStorage`, so nothing is uploaded anywhere and no login is required.
@@ -91,7 +91,7 @@ file. `index.html` at the repository root is both the source and the production 
 ## Project structure
 
 ```
-hisabkit/
+HisaabKit/
 ├── index.html                        # The entire application (HTML + CSS + JS)
 ├── README.md
 ├── .gitignore
