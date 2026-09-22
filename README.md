@@ -9,10 +9,9 @@ medium trading businesses. It tracks stock as it moves through the business:
 PURCHASE  →  STOCK IN  →  INVENTORY  →  SALE  →  STOCK OUT  →  STOCK LEDGER
 ```
 
-This is a **Phase 1 prototype**. It is a single self-contained `index.html` with no
-build step and no dependencies — open it and it runs. Inventory is synced with a
-Google Sheet through a Google Apps Script Web App; everything else stays in the
-browser's `localStorage`.
+It is a single self-contained `index.html` with no build step and no dependencies —
+open it and it runs. All data lives in a Google Spreadsheet, reached through one
+Google Apps Script Web App that serves every module.
 
 ---
 
@@ -20,39 +19,86 @@ browser's `localStorage`.
 
 **https://mehulmwork.github.io/HisaabKit/**
 
-Repository: **https://github.com/mehulmwork/HisaabKit**
+Repository: **https://github.com/mehulmwork/HisabKit**
 
-The site is public and needs no login. Inventory items are read from and written to
-a Google Sheet, so the item list is shared between everyone who opens the site;
-parties, purchases, sales, the stock ledger and settings live only in your own
-browser's `localStorage`.
+The site is public and needs no login.
 
 ---
 
-## Features currently implemented
+## Architecture
+
+```
+HisabKit frontend (index.html)
+        │  one endpoint, one API client
+        ▼
+Google Apps Script Web App  (apps-script/Code.gs)
+        ▼
+Google Spreadsheet — 11 tabs
+   Items · Categories · Customers · Suppliers · Purchases · Purchase_Items
+   Sales · Sales_Items · Stock_Ledger · Payments · Settings
+```
+
+The Apps Script is **generic**: it validates the requested tab against a schema,
+reads column headers from row 1, and offers `list`, `get`, `create`, `update`,
+`delete`, `transaction`, `dump`, `meta` and `setup` for every tab. There is no
+per-sheet endpoint to maintain.
+
+The frontend has one API client (the `API` object in section 4b of `index.html`).
+No other part of the file calls `fetch()`.
+
+### Writes that must not half-apply
+
+Google Sheets has no transactions. A purchase touches four tabs — `Purchases`,
+`Purchase_Items`, `Items` and `Stock_Ledger` — and a sale the same. So the app sends
+them as **one `transaction` request**, and Apps Script:
+
+1. validates every operation before touching anything,
+2. takes a script lock,
+3. snapshots every tab the batch will write,
+4. applies the operations, and
+5. on the first failure restores the snapshots and returns
+   `Nothing was saved — <reason>`.
+
+A purchase header therefore cannot be saved without its lines, and a failure part
+way through leaves the sheet exactly as it was.
+
+### Offline behaviour
+
+The Google Sheet is the source of truth. `localStorage` holds only the last
+successful read, so the app still opens when the network is down, and a small queue
+of master-data writes (items, categories, customers, suppliers) made while offline,
+pushed on the next successful load. A purchase, sale or payment that fails is
+reported to the user instead of being queued — replaying half of one later would be
+worse than not saving it.
+
+---
+
+## Features
 
 | Area | Status |
 | --- | --- |
-| **Inventory** — item catalogue, 4 live summary cards, search / category / stock-status / supplier filters, sortable paginated table (10 / 25 / 50 per page), row action menu | Working |
-| **Items** — add, edit, view, delete (with confirmation), auto-generated SKU, GST rate, low-stock alert level | Working |
-| **Stock Adjustment** — Stock In, Stock Out, Damage, Correction, each writing a ledger entry | Working |
-| **Stock Ledger** — full movement history with a running balance per item, filterable by item, date range and transaction type | Working |
-| **Purchase Bills** — list with Paid / Unpaid / Total summary cards, period + supplier + payment-status filters | Working |
-| **Add Purchase** — multi-line item entry, auto-filled unit and price, GST calculation, discount, round-off, payment type, balance due | Working |
-| **Sales Invoices** — today's / this month's / receivables cards, recent sales, full invoice entry that deducts stock and writes ledger entries | Working |
-| **Parties** — customers and suppliers with add / edit / delete / search | Working |
-| **Dashboard** — Today's Sales, Today's Purchases, Inventory Value, Receivables, Payables, plus stock alerts and top movers | Working |
-| **Reports** — Stock Report (opening / in / out / closing / value) with date, category and item filters | Working |
+| **Inventory** — item catalogue, summary cards, search / category / stock-status / supplier filters, sortable paginated table, row action menu | Working, sheet-backed |
+| **Items** — add, edit, delete (with reference checks), auto-generated SKU, GST rate, low-stock level, opening stock written to the ledger | Working, sheet-backed |
+| **Categories** — list, add, edit, delete, Active/Inactive, item counts and values per category; the item form's Category dropdown is built from this sheet | Working, sheet-backed |
+| **Customers** and **Suppliers** — list, add, edit, delete, search, opening balance, credit limit, GSTIN | Working, sheet-backed |
+| **Purchase Bills** — multi-line entry with a supplier dropdown, GST, discount and round-off; saving increases stock, writes a ledger row per line, and records a payment when part of the bill is paid | Working, sheet-backed |
+| **Sales Invoices** — the same entry flow, validated against available stock, so an invoice can never take stock below zero | Working, sheet-backed |
+| **Stock Ledger** — every movement with a running balance, filterable by item, date range and transaction type | Working, sheet-backed |
+| **Payments** — money received from customers and paid to suppliers, filterable, with a party dropdown that follows the party type and optional settlement against a specific bill or invoice | Working, sheet-backed |
+| **Settings** — business profile, currency symbol, tax defaults, invoice and purchase prefixes, low-stock alert, read from and written to the Settings sheet | Working, sheet-backed |
+| **Dashboard** — live totals for sales, purchases, inventory value, receivables, payables, customer and supplier counts, plus stock alerts and top movers | Working, live from the sheet |
+| **Reports** — Stock Report with date, category and item filters | Working |
 | **Export & Print** — CSV export (UTF-8 BOM so Excel reads `₹` correctly) and print stylesheets | Working |
 | **Cash & Bank**, **Sales Returns**, **Purchase Returns**, **Purchase / Sales / Profit reports** | Placeholder navigation — reserved for a later phase |
 
 ### Correctness note
 
-The stock ledger is the **source of truth**. Every stock movement writes a ledger
-row, and each item's `currentStock` is reconciled from the sum of its movements, so
-the inventory figure and the ledger can never disagree. Sales are validated against
-available stock before anything is written, so a sale can never half-apply, and
-stock cannot go negative except through an explicit *Correction* adjustment.
+The sheet's `CurrentStock` is authoritative, and the ledger records what this app has
+done since. On every read the app works out what the ledger already accounts for and
+puts the difference in front of it as a local **Opening Stock** entry. Without that,
+an item that arrived with 50 in stock would be rewritten to the total of its later
+movements. The padding is never written to the sheet, and it is rebuilt on every
+load.
 
 ---
 
@@ -65,53 +111,47 @@ No install, no build, no server required.
 2. Double-click index.html   (or drag it into any modern browser)
 ```
 
-That's it. Because there are no external asset references, it also works fine when
-opened directly from the filesystem via `file://` — the Google Sheets sync included.
-
 If you prefer to serve it over HTTP:
 
 ```bash
 python -m http.server 8000     # then open http://localhost:8000
 ```
 
-### Google Sheets sync
-
-The **Items** sheet is the source of truth for Inventory whenever the Apps Script
-Web App is reachable. On startup the app calls it, and the Inventory table shows
-the sheet's rows. Adding an item posts it to the sheet and then re-reads the list,
-so what you see always came back from Google.
-
-If the API cannot be reached, the app falls back to the last known items held in
-`localStorage` and says so. An item added while the sheet is unreachable is kept on
-that device and pushed to the sheet automatically on the next successful load.
-
-Two things are deliberately local-only for now: **editing** and **deleting** an
-item, because this phase of the API defines only GET and POST. An edit or delete
-changes your browser's copy and will be overwritten the next time the sheet is read.
-
-The endpoint is configured by `API_CONFIG.url` near the top of the script in
-`index.html`. Requests are sent as `text/plain` rather than `application/json` —
-Apps Script does not answer the CORS preflight, so a JSON content-type would be
-rejected by the browser.
-
-### Demo data
-
-If the sheet is unreachable on a first visit, the app seeds realistic demo data —
-24 inventory items, 10 suppliers, 12 customers, 12 purchase bills, 16 sales invoices
-and ~94 stock ledger entries — covering an AC and refrigeration trading business.
-
-When the Google Sheet answers, **no demo data is created** and none of it is mixed
-with the sheet's rows.
-
-Seeding happens **once**, and is stored in `localStorage`. To start over, use
-**Settings → Reset demo data**.
-
 ---
 
-## Building
+## Google Apps Script setup
 
-**There is no build step.** The project is plain HTML, CSS and JavaScript in a single
-file. `index.html` at the repository root is both the source and the production output.
+`apps-script/Code.gs` is the **complete** backend. It must be pasted into the Apps
+Script project bound to the spreadsheet and redeployed before the frontend can use
+the new modules.
+
+1. Open the spreadsheet → **Extensions → Apps Script**.
+2. Replace the whole contents of `Code.gs` with the file from this repository.
+3. Save (**Ctrl+S**).
+4. **Deploy → Manage deployments →** pencil icon on the existing deployment **→
+   Version: New version → Deploy**. Editing the code without deploying a new version
+   leaves the old code serving requests.
+5. On its first call the app runs `setup`, which creates any missing tab with its
+   header row. It never deletes or rewrites existing rows.
+
+Then set the deployment URL in `API_CONFIG.url` near the top of `index.html` if
+yours differs from the one in the repository.
+
+### Why requests are sent as `text/plain`
+
+Apps Script does not answer the CORS preflight, so a request with
+`Content-Type: application/json` is rejected by the browser before it is sent. The
+app posts JSON bodies as `text/plain;charset=utf-8`, which is a CORS "simple
+request" and needs no preflight. Apps Script reads the body from
+`e.postData.contents` regardless of the declared type. `GET` requests use query
+parameters.
+
+### ID generation
+
+IDs follow the sheet's own sequence: the highest number already used for that
+prefix, plus one. Prefixes are `ITM-`, `CAT-`, `CUS-`, `SUP-`, `PUR-`, `PI-`,
+`SAL-`, `SI-`, `LED-`, `PAY-`, `SET-`. An ID that does not match the pattern (a
+legacy row) is ignored rather than counted, and existing IDs are never rewritten.
 
 ---
 
@@ -120,6 +160,8 @@ file. `index.html` at the repository root is both the source and the production 
 ```
 HisaabKit/
 ├── index.html                        # The entire application (HTML + CSS + JS)
+├── apps-script/
+│   └── Code.gs                       # The complete Apps Script backend
 ├── README.md
 ├── .gitignore
 ├── .nojekyll                         # Serve files as-is; skip Jekyll processing
@@ -128,38 +170,29 @@ HisaabKit/
         └── deploy-pages.yml          # Builds nothing; publishes the root to GitHub Pages
 ```
 
-Inside `index.html` the code is organised into labelled sections so it can be migrated
-to React/Next.js and a real database later without a rewrite:
+Inside `index.html` the code is organised into labelled sections so it can be
+migrated to React/Next.js and a real database later without a rewrite:
 
-1. Constants (storage keys, units, GST rates, payment and adjustment types)
+1. Constants (storage keys, sheet schema mirror, settings definitions, units, GST rates)
 2. State
-3. Utilities (currency, date, id generation, escaping)
-4. Persistence (`loadData`, `saveData`, `seedDemoData`)
-5. Toast notifications
+3. Utilities (currency, date, escaping)
+4. Persistence (`loadData`, `saveData`) and **4b. Google Sheets — API client and data access**
+5. Toast notifications, busy indicator, sync banner
 6. Modal system
-7. Domain logic (stock status, ledger, adjustments, purchases, sales)
+7. Domain logic (stock status, ledger, items, purchases, sales, payments)
 8. Rendering (one `render*` function per page)
 9. Navigation and event listeners
 10. Initialisation
 
-### Data model
+### Sheet column mapping
 
-Records are plain JSON objects referenced by `id`, so they map directly onto database
-tables later. Persisted under `localStorage` keys:
-`hisabkit_items`, `hisabkit_suppliers`, `hisabkit_customers`, `hisabkit_purchases`,
-`hisabkit_sales`, `hisabkit_stock_ledger`, `hisabkit_settings`.
+Each tab has a mapper pair in `SHEET_MAP` — one function from a sheet row to an app
+record, and one back: `ItemID`→`id`, `ItemName`→`name`, `CurrentStock`→`currentStock`,
+and so on. The Items sheet has no columns for brand, GST rate, supplier or
+description, so those four are kept in `localStorage` and re-applied on every read.
 
-`hisabkit_items` acts as the offline cache of the **Items** sheet. The sheet's
-columns map onto the item record as: `ItemID`→`id`, `SKU`→`sku`, `ItemName`→`name`,
-`Category`→`category`, `Unit`→`unit`, `PurchasePrice`→`purchasePrice`,
-`SellingPrice`→`sellingPrice`, `CurrentStock`→`currentStock`,
-`LowStockLevel`→`lowStockLevel`, `Status`→`sheetStatus`. The app has no column of
-its own for brand, GST rate, supplier or description, so those are kept locally and
-preserved across syncs.
-
-The Inventory badge is **derived** from stock levels (`In Stock` / `Low Stock` /
-`Out of Stock`), not read from the sheet's `Status` column — that value is stored on
-the item as `sheetStatus` but is not displayed.
+Records are plain JSON objects referenced by `id`, so they map directly onto
+database tables later.
 
 ---
 
@@ -169,24 +202,21 @@ Hosted on **GitHub Pages**, deployed automatically by **GitHub Actions**
 (`.github/workflows/deploy-pages.yml`) on every push to `main`. Because there is no
 build step, the workflow simply uploads the repository root as the Pages artifact.
 
-No secrets, tokens or credentials are required by the application or the workflow —
-the workflow uses GitHub's own OIDC-based Pages deployment, so there is nothing to
-configure.
+The Apps Script deployment is separate and manual — see **Google Apps Script
+setup** above.
 
 ---
 
 ## Currency and locale
 
-All amounts are formatted with `Intl.NumberFormat('en-IN', { style: 'currency',
-currency: 'INR' })`, giving Indian lakh/crore grouping (`₹1,25,000`), with decimals
-dropped on whole amounts. Dates display as `DD/MM/YYYY`.
+Amounts are grouped the Indian way (`₹1,25,000`), with decimals dropped on whole
+amounts. The symbol comes from the `CurrencySymbol` row in the Settings sheet, so
+changing it there changes every amount in the app. Dates display as `DD/MM/YYYY`.
 
 ---
 
 ## Not in this phase
 
-Deliberately out of scope for Phase 1: users and authentication, real GST invoices,
-PDF generation, barcode scanning, batch/serial numbers, multiple warehouses, returns,
-and full accounting. Only the **Items** sheet is wired up so far — parties, purchases,
-sales and the ledger are not yet synced to Google Sheets. The data model is kept
-compatible with adding them.
+Deliberately out of scope: users and authentication, real GST invoices, PDF
+generation, barcode scanning, batch/serial numbers, multiple warehouses, and full
+accounting. Sales Returns and Purchase Returns are navigation placeholders.

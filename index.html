@@ -304,6 +304,7 @@ svg{display:block;flex-shrink:0;}
 }
 .badge::before{content:'';width:5px;height:5px;border-radius:50%;background:currentColor;}
 .badge-instock{background:var(--success-soft);color:#15803D;}
+.badge-active{background:var(--success-soft);color:#15803D;}
 .badge-lowstock{background:var(--warning-soft);color:#B45309;}
 .badge-outstock{background:var(--danger-soft);color:#B91C1C;}
 .badge-paid{background:var(--success-soft);color:#15803D;}
@@ -634,9 +635,29 @@ tbody td.col-check{padding-left:14px;}
   .badge{border:1px solid #999;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
   @page{margin:12mm;}
 }
+.sync-bar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 900;
+  display: none; align-items: center; gap: 9px;
+  padding: 7px 16px; font-size: 12.5px; font-weight: 600;
+  background: var(--brand, #2F53D6); color: #fff;
+}
+.sync-bar.active { display: flex; }
+.sync-bar.offline { display: flex; background: var(--danger, #C0392B); }
+.sync-bar .sync-text { flex: 1; }
+.sync-bar .spinner {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.4); border-top-color: #fff;
+  display: inline-block; animation: hk-spin .7s linear infinite;
+}
+button .spinner { margin-right: 2px; vertical-align: -1px; }
+@keyframes hk-spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
+
+<div class="sync-bar" id="syncBar" role="status" aria-live="polite">
+  <span class="spinner"></span><span class="sync-text"></span>
+</div>
 
 <div id="app">
   <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
@@ -676,11 +697,13 @@ tbody td.col-check{padding-left:14px;}
    ============================================================ */
 const STORAGE_KEYS = {
   items:       'hisabkit_items',
+  categories:  'hisabkit_categories',
   suppliers:   'hisabkit_suppliers',
   customers:   'hisabkit_customers',
   purchases:   'hisabkit_purchases',
   sales:       'hisabkit_sales',
   ledger:      'hisabkit_stock_ledger',
+  payments:    'hisabkit_payments',
   settings:    'hisabkit_settings'
 };
 
@@ -692,58 +715,151 @@ const PAYMENT_TYPES = ['Cash','Bank','UPI','Credit'];
 
 const ADJUSTMENT_TYPES = ['Stock In','Stock Out','Damage','Correction'];
 
-const LEDGER_TYPES = ['Purchase','Sale','Return','Adjustment','Damage','Correction'];
+const LEDGER_TYPES = ['Opening Stock','Purchase','Sale','Purchase Return','Sales Return',
+                      'Return','Adjustment','Damage','Correction'];
 
 /**
- * Google Apps Script Web App that fronts the HisabKit "Items" sheet.
+ * Google Apps Script Web App that fronts the whole HisabKit spreadsheet.
  *
- * GET  -> { success: true, items: [ {ItemID, SKU, ...}, ... ] }
- * POST -> one item object, using the exact sheet column names below.
+ * One endpoint serves every table. The frontend sends an `action` plus a
+ * `sheet` name and the API answers with `{ success, data }` — see
+ * apps-script/Code.gs for the server side of this contract.
  *
  * Apps Script answers a JSON content-type POST with an OPTIONS preflight that
- * carries no Access-Control-Allow-Origin, so the POST is sent as text/plain
+ * carries no Access-Control-Allow-Origin, so every POST is sent as text/plain
  * instead — that stays a CORS "simple request" and skips the preflight.
  */
 const API_CONFIG = {
   url: 'https://script.google.com/macros/s/AKfycbyec-wwxV5FTw7Hgn9vRv4kgi9NVC3jUyiZ76gluK7hG9BaMDBSggp1iOxcn-9MIURt/exec',
-  timeoutMs: 12000
+  timeoutMs: 20000,
+  expectedVersion: '2.0.0'
 };
 
-/** The sheet's columns, in order — the wire contract for GET and POST. */
-const SHEET_COLUMNS = ['ItemID','SKU','ItemName','Category','Unit',
-                       'PurchasePrice','SellingPrice','CurrentStock',
-                       'LowStockLevel','Status'];
+/**
+ * The spreadsheet's tables, mirroring SCHEMA in apps-script/Code.gs.
+ *
+ * `columns` is the exact header row of that tab. `idField` and `prefix` drive
+ * ID generation, which reads the highest existing number in the sheet and adds
+ * one, so the sequence continues past IDs that were created by hand.
+ */
+const SHEETS = {
+  Items: {
+    idField: 'ItemID', prefix: 'ITM-', state: 'items',
+    columns: ['ItemID','SKU','ItemName','Category','Unit','PurchasePrice',
+              'SellingPrice','CurrentStock','LowStockLevel','Status']
+  },
+  Categories: {
+    idField: 'CategoryID', prefix: 'CAT-', state: 'categories',
+    columns: ['CategoryID','CategoryName','Description','Status']
+  },
+  Customers: {
+    idField: 'CustomerID', prefix: 'CUS-', state: 'customers',
+    columns: ['CustomerID','CustomerName','Phone','Email','Address','GSTIN',
+              'OpeningBalance','BalanceType','CreditLimit','Status']
+  },
+  Suppliers: {
+    idField: 'SupplierID', prefix: 'SUP-', state: 'suppliers',
+    columns: ['SupplierID','SupplierName','Phone','Email','Address','GSTIN',
+              'OpeningBalance','BalanceType','CreditLimit','Status']
+  },
+  Purchases: {
+    idField: 'PurchaseID', prefix: 'PUR-', state: 'purchases',
+    columns: ['PurchaseID','BillNo','SupplierID','PurchaseDate','SubTotal',
+              'TaxAmount','Discount','TotalAmount','PaidAmount','DueAmount',
+              'PaymentStatus','Notes']
+  },
+  Purchase_Items: {
+    idField: 'PurchaseItemID', prefix: 'PI-', state: null,
+    columns: ['PurchaseItemID','PurchaseID','ItemID','Quantity','Unit',
+              'PurchasePrice','Discount','TaxRate','TaxAmount','TotalAmount']
+  },
+  Sales: {
+    idField: 'SaleID', prefix: 'SAL-', state: 'sales',
+    columns: ['SaleID','InvoiceNo','CustomerID','SaleDate','SubTotal',
+              'TaxAmount','Discount','TotalAmount','PaidAmount','DueAmount',
+              'PaymentStatus','Notes']
+  },
+  Sales_Items: {
+    idField: 'SaleItemID', prefix: 'SI-', state: null,
+    columns: ['SaleItemID','SaleID','ItemID','Quantity','Unit','SellingPrice',
+              'Discount','TaxRate','TaxAmount','TotalAmount']
+  },
+  Stock_Ledger: {
+    idField: 'LedgerID', prefix: 'LED-', state: 'ledger',
+    columns: ['LedgerID','ItemID','DateTime','TransactionType','ReferenceID',
+              'QuantityIn','QuantityOut','BalanceStock','Unit','Notes']
+  },
+  Payments: {
+    idField: 'PaymentID', prefix: 'PAY-', state: 'payments',
+    columns: ['PaymentID','PaymentDate','PartyType','PartyID','ReferenceType',
+              'ReferenceID','Amount','PaymentMode','TransactionType','Notes']
+  },
+  Settings: {
+    idField: 'SettingID', prefix: 'SET-', state: null,
+    columns: ['SettingID','SettingKey','SettingValue','Description','Status']
+  }
+};
 
-const DEFAULT_CATEGORIES = [
-  'Copper Pipes','Refrigerant','Insulation','AC Parts',
-  'Electrical','Tools','Accessories','Consumables'
+/** Tab a route reads from, for the "last synced" footer and diagnostics. */
+const SHEET_ORDER = ['Items','Categories','Customers','Suppliers','Purchases',
+                     'Purchase_Items','Sales','Sales_Items','Stock_Ledger',
+                     'Payments','Settings'];
+
+/** Payment modes offered by the Payments form (payment *types* stay above). */
+const PAYMENT_MODES = ['Cash','UPI','Bank Transfer','Card','Cheque'];
+
+/**
+ * Settings that live in the Settings sheet as SettingKey/SettingValue rows.
+ * `key` is the sheet's SettingKey, `field` is the name the app uses in
+ * state.settings, so the UI code keeps reading the same camelCase names.
+ * `label` and `hint` drive the Settings screen; `fallback` is used until the
+ * sheet answers.
+ */
+const SETTING_DEFS = [
+  { key:'BusinessName',   field:'businessName',  label:'Business Name',    fallback:'My Business', hint:'Shown in the sidebar and on printouts.' },
+  { key:'UserName',       field:'userName',      label:'User Name',        fallback:'Admin',       hint:'Shown under the business name.' },
+  { key:'GSTIN',          field:'gstin',         label:'Business GSTIN',   fallback:'',            hint:'Printed on invoices.' },
+  { key:'Phone',          field:'phone',         label:'Phone',            fallback:'' },
+  { key:'Address',        field:'address',       label:'Address',          fallback:'' },
+  { key:'Currency',       field:'currency',      label:'Currency Code',    fallback:'INR',         hint:'ISO code, e.g. INR.' },
+  { key:'CurrencySymbol', field:'currencySymbol',label:'Currency Symbol',  fallback:'₹',           hint:'Controls every amount shown in the app.' },
+  { key:'TaxEnabled',     field:'taxEnabled',    label:'Tax Enabled',      fallback:'Yes',         hint:'Yes or No.' },
+  { key:'DefaultTaxRate', field:'defaultTaxRate',label:'Default Tax Rate', fallback:'18',          hint:'Percent applied to new lines.' },
+  { key:'InvoicePrefix',  field:'invoicePrefix', label:'Invoice Prefix',   fallback:'INV-',        hint:'Used for new sales invoice numbers.' },
+  { key:'PurchasePrefix', field:'purchasePrefix',label:'Purchase Prefix',  fallback:'PUR-',        hint:'Used for new purchase bill numbers.' },
+  { key:'LowStockAlert',  field:'lowStockAlert', label:'Low Stock Alert',  fallback:'Yes',         hint:'Yes or No.' }
 ];
 
-const DEFAULT_SETTINGS = {
-  businessName: 'My Business',
-  userName: 'Admin',
-  gstin: '',
-  phone: '',
-  address: '',
-  lowStockAlert: true
-};
+/** Default settings object, in the app's own camelCase shape. */
+const DEFAULT_SETTINGS = (function () {
+  const out = {};
+  SETTING_DEFS.forEach(d => { out[d.field] = d.fallback; });
+  out.lowStockAlert = true;      // the UI reads this as a boolean
+  out.taxEnabled = true;
+  return out;
+})();
 
 /* ============================================================
    2. APPLICATION STATE
    ============================================================ */
 const state = {
   items: [],
+  categories: [],
   suppliers: [],
   customers: [],
   purchases: [],
   sales: [],
   ledger: [],
+  payments: [],
   settings: { ...DEFAULT_SETTINGS },
+  settingRows: [],     // raw Settings sheet rows, so a save can update them in place
 
   // UI state (not persisted)
   route: 'inventory',
   sidebarCollapsed: false,
   apiOnline: false,     // true once the Google Sheet has answered
+  apiError: '',         // last failure, shown in the sync banner
+  lastSync: null,       // ISO timestamp of the last successful read
   inventory: {
     search: '', category: '', stockStatus: '', supplier: '',
     sortKey: 'sku', sortDir: 'asc',
@@ -753,6 +869,7 @@ const state = {
   ledgerFilter: { itemId: '', type: '', from: '', to: '' },
   purchaseFilter: { range: 'thisMonth', from: '', to: '', supplierId: '', paymentStatus: '' },
   salesFilter: { range: 'thisMonth', from: '', to: '', customerId: '' },
+  paymentFilter: { partyType: '', transactionType: '', from: '', to: '' },
   reportFilter: { from: '', to: '', category: '', itemId: '' }
 };
 
@@ -760,16 +877,27 @@ const state = {
    3. UTILITY FUNCTIONS
    ============================================================ */
 
-/** Indian currency formatting: ₹1,25,000 — no decimals on whole amounts. */
+/**
+ * The currency symbol configured in Settings, falling back to the rupee when
+ * the Settings sheet has not answered yet.
+ */
+function currencySymbol() {
+  const symbol = state && state.settings ? state.settings.currencySymbol : '';
+  return symbol ? String(symbol) : '₹';
+}
+
+/**
+ * Indian currency formatting with the configured symbol: ₹1,25,000, with no
+ * decimals on whole amounts.
+ */
 function formatCurrency(value, forceDecimals) {
   const n = Number(value) || 0;
   const whole = Math.abs(n % 1) < 0.005;
-  return new Intl.NumberFormat('en-IN', {
-    style: 'currency',
-    currency: 'INR',
+  const body = new Intl.NumberFormat('en-IN', {
     minimumFractionDigits: (forceDecimals || !whole) ? 2 : 0,
     maximumFractionDigits: 2
-  }).format(n);
+  }).format(Math.abs(n));
+  return (n < 0 ? '-' : '') + currencySymbol() + body;
 }
 
 /** Plain Indian-grouped number, e.g. 1,25,000 */
@@ -814,10 +942,6 @@ function endOfMonthISO() {
   return `${last.getFullYear()}-${String(last.getMonth()+1).padStart(2,'0')}-${String(last.getDate()).padStart(2,'0')}`;
 }
 
-/** Collision-resistant enough for a client-side prototype. */
-function generateId(prefix) {
-  return `${prefix || 'id'}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-}
 
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
@@ -918,13 +1042,15 @@ function loadData() {
       const parsed = JSON.parse(raw);
       return parsed === null || parsed === undefined ? fallback : parsed;
     };
-    state.items     = read(STORAGE_KEYS.items, []);
-    state.suppliers = read(STORAGE_KEYS.suppliers, []);
-    state.customers = read(STORAGE_KEYS.customers, []);
-    state.purchases = read(STORAGE_KEYS.purchases, []);
-    state.sales     = read(STORAGE_KEYS.sales, []);
-    state.ledger    = read(STORAGE_KEYS.ledger, []);
-    state.settings  = Object.assign({}, DEFAULT_SETTINGS, read(STORAGE_KEYS.settings, {}));
+    state.items      = read(STORAGE_KEYS.items, []);
+    state.categories = read(STORAGE_KEYS.categories, []);
+    state.suppliers  = read(STORAGE_KEYS.suppliers, []);
+    state.customers  = read(STORAGE_KEYS.customers, []);
+    state.purchases  = read(STORAGE_KEYS.purchases, []);
+    state.sales      = read(STORAGE_KEYS.sales, []);
+    state.ledger     = read(STORAGE_KEYS.ledger, []);
+    state.payments   = read(STORAGE_KEYS.payments, []);
+    state.settings   = Object.assign({}, DEFAULT_SETTINGS, read(STORAGE_KEYS.settings, {}));
   } catch (err) {
     console.error('HisabKit: failed to load data from localStorage', err);
     showToast('Could not read saved data. Starting fresh.', 'error');
@@ -933,18 +1059,13 @@ function loadData() {
 
 function saveData(keys) {
   try {
-    const all = {
-      items: STORAGE_KEYS.items,
-      suppliers: STORAGE_KEYS.suppliers,
-      customers: STORAGE_KEYS.customers,
-      purchases: STORAGE_KEYS.purchases,
-      sales: STORAGE_KEYS.sales,
-      ledger: STORAGE_KEYS.ledger,
-      settings: STORAGE_KEYS.settings
-    };
+    const all = {};
+    Object.keys(STORAGE_KEYS).forEach(k => { all[k] = STORAGE_KEYS[k]; });
     const which = keys && keys.length ? keys : Object.keys(all);
     which.forEach(k => {
-      if (all[k]) localStorage.setItem(all[k], JSON.stringify(state[k]));
+      if (all[k] && state[k] !== undefined) {
+        localStorage.setItem(all[k], JSON.stringify(state[k]));
+      }
     });
   } catch (err) {
     console.error('HisabKit: failed to save to localStorage', err);
@@ -952,305 +1073,39 @@ function saveData(keys) {
   }
 }
 
-/** Seed realistic demo data. Runs only on first launch. */
-function seedDemoData() {
-  const today = todayISO();
-
-  /* ---------- Suppliers ---------- */
-  const supplierSeeds = [
-    ['Shree Traders',        '9811045621', 'sales@shreetraders.in',   '12, Loha Mandi, Naraina, New Delhi 110028',    '07AABCS1429P1Z5', 0],
-    ['Agarwal Enterprises',  '9873451209', 'info@agarwalent.co.in',   '45, Chawri Bazar, Delhi 110006',               '07AACFA2231K1ZP', 24500],
-    ['Delhi Refrigeration',  '9911223344', 'contact@delhirefrig.in',  '8, Okhla Industrial Area Ph-II, New Delhi 110020','07AADCD8891L1ZQ', 0],
-    ['National Hardware',    '9810789012', 'nationalhw@gmail.com',    '221, Sadar Bazar, Delhi 110006',               '07AAGCN5567M1ZR', 12000],
-    ['R.K. Agencies',        '9953012345', 'rk.agencies@rediffmail.com','56, Karol Bagh, New Delhi 110005',           '07AAHCR3345N1ZS', 0],
-    ['Bharat Copper House',  '9876543210', 'bharatcopper@yahoo.in',   '9, Kirti Nagar, New Delhi 110015',             '07AAICB7712Q1ZT', 0],
-    ['Cool Point Suppliers', '9899123456', 'coolpoint.supply@gmail.com','77, Mayapuri Industrial Area, New Delhi 110064','07AAJCP9903R1ZU', 8600],
-    ['Metro Electricals',    '9812345678', 'metroelec@outlook.com',   '33, Bhagirath Palace, Delhi 110006',           '07AAKCM4428S1ZV', 0],
-    ['Sunrise Insulation',   '9801234567', 'sunrise.insul@gmail.com', '18, Wazirpur Industrial Area, Delhi 110052',   '07AALCS1176T1ZW', 0],
-    ['Ganpati Tools Mart',   '9971122334', 'ganpatitools@gmail.com',  '5, Bawana Road, Delhi 110039',                 '07AAMCG6634U1ZX', 4200]
-  ];
-  state.suppliers = supplierSeeds.map((s, i) => ({
-    id: `sup_${String(i+1).padStart(3,'0')}`,
-    name: s[0], phone: s[1], email: s[2], address: s[3],
-    gstin: s[4], openingBalance: s[5]
-  }));
-
-  /* ---------- Customers ---------- */
-  const customerSeeds = [
-    ['Sky Aircon',           '9810234567', 'skyaircon@gmail.com',     'A-14, Lajpat Nagar-II, New Delhi 110024',   '07AAECS1122A1Z9', 0],
-    ['Ramesh Enterprises',   '9871122334', 'ramesh.ent@yahoo.in',     'Shop 4, Gandhi Market, Delhi 110031',       '07AAFCR3344B1Z8', 18500],
-    ['Anshul Bajaj',         '9988776655', 'anshul.bajaj@gmail.com',  'C-92, Preet Vihar, Delhi 110092',           '',                0],
-    ['Monu Traders',         '9812340987', 'monutraders@gmail.com',   '12, Tilak Nagar, New Delhi 110018',         '07AAGCM5566C1Z7', 0],
-    ['Cool Care Services',   '9899001122', 'coolcare.delhi@gmail.com','B-7, Rohini Sector-8, Delhi 110085',        '07AAHCC7788D1Z6', 9200],
-    ['Sharma Refrigeration', '9811223344', 'sharmaref@rediffmail.com','44, Uttam Nagar, New Delhi 110059',         '07AAICS9900E1Z5', 0],
-    ['Vikas Cooling Systems','9900112233', 'vikascooling@gmail.com',  'Plot 19, Dwarka Sector-12, New Delhi 110078','07AAJCV1234F1Z4', 0],
-    ['Gupta Air Solutions',  '9822334455', 'guptaair.sol@gmail.com',  '23, Pitampura, Delhi 110034',               '07AAKCG5678G1Z3', 6400],
-    ['Deepak Electricals',   '9833445566', 'deepak.elec@gmail.com',   '88, Shahdara, Delhi 110032',                '07AALCD9012H1Z2', 0],
-    ['Nova HVAC Solutions',  '9844556677', 'novahvac@gmail.com',      'Sector 63, Noida, UP 201301',               '09AAMCN3456I1Z1', 0],
-    ['Prime Aircon Pvt Ltd', '9855667788', 'prime.aircon@gmail.com',  'Udyog Vihar Ph-IV, Gurugram, HR 122015',    '06AANCP7890J1Z0', 15000],
-    ['Balaji Cooling Point', '9866778899', 'balajicool@gmail.com',    'Sector 18, Faridabad, HR 121002',           '06AAOCB2345K1ZY', 0]
-  ];
-  state.customers = customerSeeds.map((c, i) => ({
-    id: `cus_${String(i+1).padStart(3,'0')}`,
-    name: c[0], phone: c[1], email: c[2], address: c[3],
-    gstin: c[4], openingBalance: c[5]
-  }));
-
-  /* ---------- Inventory items ----------
-     20 items across the categories in the spec, plus a few extras so
-     filters and pagination have something to work with.
-     [sku, name, category, brand, unit, purchasePrice, sellingPrice,
-      gstRate, openingStock, lowStockLevel, supplierIndex, description]
-  */
-  const itemSeeds = [
-    ['AC-001','Copper Pipe 1/4"','Copper Pipes','Bharat Copper','Meter',180,240,18,450,100,5,'Seamless copper tubing, 1/4 inch OD, refrigeration grade.'],
-    ['AC-002','Copper Pipe 3/8"','Copper Pipes','Bharat Copper','Meter',260,340,18,72,100,5,'Seamless copper tubing, 3/8 inch OD.'],
-    ['AC-003','R-32 Refrigerant','Refrigerant','Gujarat Fluorochem','Kg',520,650,18,0,10,2,'Eco-friendly HFC refrigerant for inverter ACs.'],
-    ['AC-004','Insulation 1/4"','Insulation','Sunrise Insulation','Meter',35,55,18,850,200,8,'Nitrile rubber pipe insulation for 1/4 inch lines.'],
-    ['AC-005','Insulation 3/8"','Insulation','Sunrise Insulation','Meter',44,68,18,620,200,8,'Nitrile rubber pipe insulation for 3/8 inch lines.'],
-    ['AC-006','R-410A Refrigerant','Refrigerant','Gujarat Fluorochem','Cylinder',1850,2350,18,14,5,2,'Blended refrigerant for non-inverter split ACs.'],
-    ['AC-007','R-22 Refrigerant','Refrigerant','SRF Ltd','Cylinder',1420,1750,18,8,6,2,'Legacy HCFC refrigerant, window AC units.'],
-    ['AC-008','Copper Pipe 1/2"','Copper Pipes','Bharat Copper','Meter',340,430,18,9,40,5,'Seamless copper tubing, 1/2 inch OD.'],
-    ['AC-009','Split AC Outdoor Fan Motor','AC Parts','Voltas','Piece',1250,1680,18,18,6,3,'Condenser fan motor, 1.5 ton split AC.'],
-    ['AC-010','Compressor 1.5 Ton','AC Parts','Emerson','Piece',6800,8600,18,11,4,3,'Hermetic rotary compressor for 1.5 ton split AC.'],
-    ['AC-011','PCB Control Board','AC Parts','Daikin','Piece',2100,2850,18,7,5,3,'Inverter control PCB, universal fit.'],
-    ['AC-012','Capacitor 45 MFD','Electrical','Epcos','Piece',145,210,18,240,80,7,'Motor run capacitor 45 MFD, 440V AC.'],
-    ['AC-013','Relay 30A','Electrical','Omron','Piece',210,320,18,4,25,7,'Overload relay for compressor protection.'],
-    ['AC-014','Digital Multimeter','Tools','Fluke','Piece',2350,3100,18,13,5,9,'Auto-ranging digital multimeter with clamp.'],
-    ['AC-015','Tube Bender Set','Tools','Rothenberger','Set',1850,2450,18,6,3,9,'Lever-type tube bender, 1/4 to 1/2 inch.'],
-    ['AC-016','Vacuum Pump 3 CFM','Tools','Value','Piece',4200,5400,18,5,3,9,'Single-stage rotary vane vacuum pump.'],
-    ['AC-017','Copper Elbow 1/4"','Accessories','Bharat Copper','Packet',210,320,18,34,20,5,'Pack of 25 copper elbows, 1/4 inch.'],
-    ['AC-018','Drain Pipe 1"','Accessories','Astral','Piece',120,190,18,0,30,4,'PVC drain pipe, 1 inch, per metre.'],
-    ['AC-019','Nylon Cable Tie 8"','Consumables','HellermannTyton','Packet',95,150,18,180,50,4,'Pack of 100 UV-resistant cable ties.'],
-    ['AC-020','Brazing Rod 2mm','Consumables','Ador','Kg',780,1050,18,22,10,4,'Silfos brazing rods, 2mm diameter.'],
-    ['AC-021','Condenser Coil 1.5T','AC Parts','Voltas','Piece',3200,4250,18,9,4,3,'Fin-and-tube condenser coil, 1.5 ton.'],
-    ['AC-022','Service Valve 1/4"','Accessories','Danfoss','Piece',380,530,18,3,15,2,'Brass service valve with flare connection.'],
-    ['AC-023','Blower Motor 1T','AC Parts','Daikin','Piece',1420,1890,18,16,6,3,'Indoor unit blower motor, 1 ton.'],
-    ['AC-024','Thermostat Controller','Electrical','Honeywell','Piece',890,1240,18,28,10,7,'Digital thermostat with remote sensor.']
-  ];
-
-  state.items = itemSeeds.map((s, i) => {
-    const created = daysAgoISO(60 - i);
-    return {
-      id: `itm_${String(i+1).padStart(3,'0')}`,
-      sku: s[0], name: s[1], category: s[2], brand: s[3], unit: s[4],
-      purchasePrice: s[5], sellingPrice: s[6], gstRate: s[7],
-      currentStock: s[8], openingStock: s[8], lowStockLevel: s[9],
-      supplierId: state.suppliers[s[10]] ? state.suppliers[s[10]].id : '',
-      description: s[11],
-      createdAt: created,
-      updatedAt: daysAgoISO(Math.max(0, 20 - i))
-    };
-  });
-
-  /* ---------- Purchases (with line items + ledger entries) ----------
-     Each seed purchase drives opening stock upward, so the ledger we
-     generate below reconciles with currentStock.
-     [supplierIndex, billNumber, daysAgo, paymentType, paidRatio, lines]
-     lines: [itemIndex, qty]
-  */
-  const purchaseSeeds = [
-    [0, 'PUR-1024', 1,  'Cash',   1.0, [[0,200],[3,300],[18,50]]],
-    [1, 'PUR-1023', 2,  'Bank',   0.5, [[1,100],[4,150],[10,4]]],
-    [2, 'PUR-1022', 3,  'Credit', 0.0, [[2,25],[6,10],[21,20]]],
-    [3, 'PUR-1021', 4,  'Cash',   1.0, [[12,60],[19,40],[17,30]]],
-    [5, 'PUR-1020', 5,  'Bank',   0.75,[[7,60],[16,40],[0,150]]],
-    [4, 'PUR-1019', 7,  'UPI',    1.0, [[8,12],[22,10],[20,6]]],
-    [6, 'PUR-1018', 9,  'Credit', 0.0, [[11,120],[13,8],[23,15]]],
-    [7, 'PUR-1017', 12, 'Cash',   1.0, [[14,5],[15,4],[9,6]]],
-    [8, 'PUR-1016', 15, 'Bank',   0.4, [[5,20],[3,250],[18,60]]],
-    [9, 'PUR-1015', 18, 'UPI',    1.0, [[13,6],[19,25],[12,80]]],
-    [1, 'PUR-1014', 22, 'Credit', 0.0, [[1,50],[4,100],[0,100]]],
-    [4, 'PUR-1013', 26, 'Cash',   1.0, [[17,40],[21,12],[23,20]]]
-  ];
-
-  state.purchases = [];
-  const purchaseLedger = [];
-
-  purchaseSeeds.forEach((p, idx) => {
-    const [supIdx, billNumber, ago, paymentType, paidRatio, lines] = p;
-    const date = daysAgoISO(ago);
-    const supplier = state.suppliers[supIdx];
-
-    const items = lines.map(([itemIdx, qty]) => {
-      const it = state.items[itemIdx];
-      const amount = round2(qty * it.purchasePrice);
-      const taxAmount = round2(amount * it.gstRate / 100);
-      return {
-        itemId: it.id, name: it.name, quantity: qty, unit: it.unit,
-        price: it.purchasePrice, gstRate: it.gstRate,
-        taxAmount, amount
-      };
-    });
-
-    const subtotal = round2(sum(items, x => x.amount));
-    const tax = round2(sum(items, x => x.taxAmount));
-    const discount = 0;
-    const raw = subtotal + tax - discount;
-    const total = Math.round(raw);
-    const roundOff = round2(total - raw);
-    const paid = round2(total * paidRatio);
-    const balance = round2(total - paid);
-
-    const purchase = {
-      id: `pur_${String(idx+1).padStart(4,'0')}`,
-      supplierId: supplier.id,
-      billNumber, date, items,
-      subtotal, discount, tax, roundOff, total, paid, balance,
-      paymentType,
-      createdAt: date
-    };
-    state.purchases.push(purchase);
-
-    items.forEach(li => {
-      purchaseLedger.push({
-        itemId: li.itemId, date,
-        reference: billNumber, type: 'Purchase',
-        quantityIn: li.quantity, quantityOut: 0,
-        reason: 'New purchase'
-      });
-    });
-  });
-
-  /* ---------- Sales (drive stock down, mirror in ledger) ---------- */
-  const saleSeeds = [
-    [0, 'INV-2041', 0,  'Cash',  1.0, [[0,30],[11,20]]],
-    [1, 'INV-2040', 0,  'UPI',   1.0, [[3,50],[18,10]]],
-    [4, 'INV-2039', 1,  'Credit',0.0, [[9,3],[10,2]]],
-    [2, 'INV-2038', 1,  'Cash',  1.0, [[13,2],[14,1]]],
-    [3, 'INV-2037', 2,  'Bank',  0.6, [[0,25],[4,40],[16,5]]],
-    [5, 'INV-2036', 3,  'Cash',  1.0, [[7,10],[6,2]]],
-    [6, 'INV-2035', 4,  'Credit',0.0, [[1,20],[22,2]]],
-    [7, 'INV-2034', 5,  'UPI',   1.0, [[8,4],[20,3]]],
-    [0, 'INV-2033', 7,  'Cash',  1.0, [[23,6],[11,30]]],
-    [8, 'INV-2032', 9,  'Bank',  0.5, [[12,25],[5,30]]],
-    [9, 'INV-2031', 11, 'Cash',  1.0, [[15,2],[19,10]]],
-    [10,'INV-2030', 14, 'Credit',0.0, [[9,2],[21,3],[10,1]]],
-    [11,'INV-2029', 17, 'UPI',   1.0, [[0,40],[3,60]]],
-    [4, 'INV-2028', 20, 'Cash',  1.0, [[13,3],[14,2],[17,8]]],
-    // Recent invoices that deliberately clear out and run down fast movers,
-    // so the demo dataset exercises all three stock statuses.
-    [5, 'INV-2042', 0,  'Cash',  1.0, [[2,25],[21,32],[7,59]]],
-    [10,'INV-2043', 0,  'UPI',   1.0, [[17,45],[11,235]]]
-  ];
-
-  state.sales = [];
-  const salesLedger = [];
-
-  saleSeeds.forEach((s, idx) => {
-    const [cusIdx, invoiceNumber, ago, paymentType, paidRatio, lines] = s;
-    const date = daysAgoISO(ago);
-    const customer = state.customers[cusIdx];
-
-    const items = lines.map(([itemIdx, qty]) => {
-      const it = state.items[itemIdx];
-      const amount = round2(qty * it.sellingPrice);
-      const taxAmount = round2(amount * it.gstRate / 100);
-      return {
-        itemId: it.id, name: it.name, quantity: qty, unit: it.unit,
-        price: it.sellingPrice, gstRate: it.gstRate,
-        taxAmount, amount
-      };
-    });
-
-    const subtotal = round2(sum(items, x => x.amount));
-    const tax = round2(sum(items, x => x.taxAmount));
-    const discount = 0;
-    const raw = subtotal + tax - discount;
-    const total = Math.round(raw);
-    const roundOff = round2(total - raw);
-    const paid = round2(total * paidRatio);
-    const balance = round2(total - paid);
-
-    state.sales.push({
-      id: `sal_${String(idx+1).padStart(4,'0')}`,
-      customerId: customer.id,
-      invoiceNumber, date, items,
-      subtotal, discount, tax, roundOff, total, paid, balance,
-      paymentType,
-      createdAt: date
-    });
-
-    items.forEach(li => {
-      salesLedger.push({
-        itemId: li.itemId, date,
-        reference: invoiceNumber, type: 'Sale',
-        quantityIn: 0, quantityOut: li.quantity,
-        reason: 'Customer sale'
-      });
-    });
-  });
-
-  /* ---------- Build the ledger ----------
-     Chronological, oldest first, so the running balance is correct.
-     Opening entries first, then purchases and sales interleaved by date.
-  */
-  const entries = [];
-
-  // Opening stock entries
-  state.items.forEach(it => {
-    if (it.openingStock > 0) {
-      entries.push({
-        itemId: it.id, date: it.createdAt,
-        reference: 'OPENING', type: 'Adjustment',
-        quantityIn: it.openingStock, quantityOut: 0,
-        reason: 'Opening stock'
-      });
-    }
-  });
-
-  purchaseLedger.concat(salesLedger).forEach(e => entries.push(e));
-
-  // Sort by date, then opening entries before movements on the same day
-  entries.sort((a, b) => {
-    if (a.date !== b.date) return a.date < b.date ? -1 : 1;
-    const rank = t => (t === 'Adjustment' ? 0 : t === 'Purchase' ? 1 : 2);
-    return rank(a.type) - rank(b.type);
-  });
-
-  // Walk forward computing the balance per item
-  const balances = {};
-  state.items.forEach(it => { balances[it.id] = 0; });
-
-  state.ledger = entries.map((e, i) => {
-    balances[e.itemId] = (balances[e.itemId] || 0) + ledgerDelta(e);
-    return {
-      id: `led_${String(i+1).padStart(5,'0')}`,
-      itemId: e.itemId,
-      date: e.date,
-      reference: e.reference,
-      type: e.type,
-      quantityIn: e.quantityIn,
-      quantityOut: e.quantityOut,
-      balance: balances[e.itemId],
-      reason: e.reason
-    };
-  });
-
-  /* ---------- Reconcile currentStock with the ledger ----------
-     Demo seeds are approximate; force the item's currentStock to the
-     real ledger-derived figure so the Inventory page, Stock Ledger and
-     summary cards all agree with each other.
-  */
-  state.items.forEach(it => {
-    const last = state.ledger.filter(l => l.itemId === it.id).pop();
-    if (last) it.currentStock = last.balance;
-    else it.currentStock = 0;
-    it.updatedAt = last ? last.date : it.createdAt;
-  });
-
-  saveData();
+/**
+ * localStorage holds a cache of the last successful read, so the app still
+ * opens with real data when the network is down. It is never the source of
+ * truth: the Google Sheet is, and every write goes there first.
+ */
+function isFirstVisit() {
+  return !localStorage.getItem(STORAGE_KEYS.items) && !state.items.length;
 }
 
-/* ---- Google Sheets API — the Items sheet ------------------------------
-   When the sheet is reachable it is the source of truth for Inventory;
-   localStorage stays the fallback when it is not. Only Items are synced —
-   parties, purchases, sales and the ledger remain local for now.
-   Field mapping (sheet -> app): ItemID->id, SKU->sku, ItemName->name,
-   Category->category, Unit->unit, PurchasePrice->purchasePrice,
-   SellingPrice->sellingPrice, CurrentStock->currentStock,
-   LowStockLevel->lowStockLevel, Status->sheetStatus.
+/* ============================================================
+   4b. GOOGLE SHEETS — API CLIENT AND DATA ACCESS
+   ============================================================
+
+   Every read and write goes through this section; no other part of the file
+   calls fetch() directly.
+
+     API.<action>()     one call to the Apps Script web app
+     loadFromApi()      startup read of every tab, in one round trip
+     refreshSheet()     re-read one tab
+     repoCreate/repoUpdate/repoDelete   write-through helpers
+     repoTransaction()  several writes applied as one unit
+
+   The sheet is the source of truth. localStorage keeps the last successful
+   read so the app still opens when the network is down, and queues master-data
+   writes made while offline so they are pushed on the next successful load.
+
+   Sheet column -> app field mapping for each table lives in SHEET_MAP below.
+   Items have four fields with no column of their own (brand, gstRate,
+   supplierId, description); those are kept in localStorage and preserved
+   across every reload.
    ---------------------------------------------------------------------- */
+
+const PENDING_KEY = 'hisabkit_pending';
 
 /** fetch() with an abort timeout, so a hung API cannot stall the app. */
 function apiFetch(url, options) {
@@ -1264,220 +1119,750 @@ function apiFetch(url, options) {
   );
 }
 
-/** One Google Sheet row -> one HisabKit item record. */
-function sheetRowToItem(row) {
-  const text = v => String(v === null || v === undefined ? '' : v).trim();
-  const stock = round2(row.CurrentStock) || 0;
+/** Technical detail to the console; a readable sentence to the user. */
+function describeApiError(err, fallback) {
+  const raw = (err && err.message) ? String(err.message) : '';
+  if (/abort/i.test(raw)) return 'Google Sheets took too long to answer. Please try again.';
+  if (/failed to fetch|networkerror|load failed|network request failed/i.test(raw)) {
+    return 'Cannot reach Google Sheets. Check your internet connection.';
+  }
+  if (/not allowed|unknown action|not bound|missing "sheet"/i.test(raw)) {
+    return 'The Google Apps Script API needs updating — see apps-script/Code.gs.';
+  }
+  if (raw && raw.length <= 140) return raw;
+  return fallback;
+}
+
+const API = {
+  /** GET with query parameters (list, get, dump, meta, setup). */
+  async getQuery(params) {
+    const qs = Object.keys(params)
+      .filter(k => params[k] !== undefined && params[k] !== null)
+      .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
+      .join('&');
+    const sep = API_CONFIG.url.indexOf('?') === -1 ? '?' : '&';
+    const url = API_CONFIG.url + sep + qs + '&_=' + Date.now();
+    console.log('[HisabKit API] GET ' + params.action + (params.sheet ? ' ' + params.sheet : ''));
+
+    const res = await apiFetch(url, { method: 'GET', redirect: 'follow', cache: 'no-store' });
+    return API.parse(res, 'GET ' + params.action);
+  },
+
+  /** POST a JSON envelope. Sent as text/plain to stay a CORS simple request. */
+  async post(body) {
+    console.log('[HisabKit API] POST ' + body.action + (body.sheet ? ' ' + body.sheet : ''));
+    const res = await apiFetch(API_CONFIG.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(body),
+      redirect: 'follow'
+    });
+    return API.parse(res, 'POST ' + body.action);
+  },
+
+  /** Unwrap the { success, data } envelope, or throw with the API's reason. */
+  async parse(res, label) {
+    if (!res.ok) {
+      const err = new Error('HTTP ' + res.status + ' ' + res.statusText);
+      console.error('[HisabKit API] ' + label + ' failed —', err.message);
+      throw err;
+    }
+
+    const raw = await res.text();
+    let body = null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      console.error('[HisabKit API] ' + label + ' failed — response was not JSON:', raw.slice(0, 200));
+      throw new Error('Google Sheets returned an unexpected response.');
+    }
+
+    if (!body || body.success !== true) {
+      const reason = (body && body.error) ? body.error : 'The API reported a failure.';
+      console.error('[HisabKit API] ' + label + ' failed —', reason, body && body.detail ? body.detail : '');
+      throw new Error(reason);
+    }
+
+    console.log('[HisabKit API] ' + label + ' ok');
+    return body.data;
+  },
+
+  list(sheet)                 { return API.getQuery({ action: 'list', sheet: sheet }); },
+  get(sheet, idField, id)     { return API.getQuery({ action: 'get', sheet: sheet, idField: idField, id: id }); },
+  create(sheet, data)         { return API.post({ action: 'create', sheet: sheet, data: data }); },
+  update(sheet, idField, id, data) { return API.post({ action: 'update', sheet: sheet, idField: idField, id: id, data: data }); },
+  remove(sheet, idField, id)  { return API.post({ action: 'delete', sheet: sheet, idField: idField, id: id }); },
+  transaction(ops)            { return API.post({ action: 'transaction', ops: ops }); },
+  dump()                      { return API.getQuery({ action: 'dump' }); },
+  meta()                      { return API.getQuery({ action: 'meta' }); },
+  setup()                     { return API.getQuery({ action: 'setup' }); }
+};
+
+/* ---- value helpers used by every mapper ---- */
+
+function cellText(v) {
+  return String(v === null || v === undefined ? '' : v).trim();
+}
+
+function cellNumber(v) {
+  const n = Number(v);
+  return isNaN(n) ? 0 : round2(n);
+}
+
+function cellBool(v) {
+  const s = cellText(v).toLowerCase();
+  return s === 'yes' || s === 'true' || s === '1' || s === 'active';
+}
+
+/* ---- row -> app record, and app record -> row ---- */
+
+function itemFromRow(row) {
+  const stock = cellNumber(row.CurrentStock);
   return {
-    id:            text(row.ItemID),
-    sku:           text(row.SKU),
-    name:          text(row.ItemName),
-    category:      text(row.Category),
-    unit:          text(row.Unit) || 'Piece',
-    purchasePrice: round2(row.PurchasePrice) || 0,
-    sellingPrice:  round2(row.SellingPrice) || 0,
+    id:            cellText(row.ItemID),
+    sku:           cellText(row.SKU),
+    name:          cellText(row.ItemName),
+    category:      cellText(row.Category),
+    unit:          cellText(row.Unit) || 'Piece',
+    purchasePrice: cellNumber(row.PurchasePrice),
+    sellingPrice:  cellNumber(row.SellingPrice),
     currentStock:  stock,
     openingStock:  stock,
-    lowStockLevel: round2(row.LowStockLevel) || 0,
-    sheetStatus:   text(row.Status),
+    lowStockLevel: cellNumber(row.LowStockLevel),
+    sheetStatus:   cellText(row.Status) || 'Active',
     source:        'sheet',
-    // The sheet has no column for these — filled from the local record or defaults.
+    // No column of their own in the sheet — restored from the local copy.
     brand: '', gstRate: 0, supplierId: '', description: '',
     createdAt: todayISO(), updatedAt: todayISO()
   };
 }
 
-/** One HisabKit item -> one Google Sheet row, using the exact column names. */
-function itemToSheetRow(item) {
-  const values = {
+function itemToRow(item) {
+  return {
     ItemID:        item.id,
     SKU:           item.sku || '',
     ItemName:      item.name || '',
     Category:      item.category || '',
     Unit:          item.unit || '',
-    PurchasePrice: Number(item.purchasePrice) || 0,
-    SellingPrice:  Number(item.sellingPrice) || 0,
-    CurrentStock:  Number(item.currentStock) || 0,
-    LowStockLevel: Number(item.lowStockLevel) || 0,
-    Status:        item.sheetStatus || 'Active'
+    PurchasePrice: cellNumber(item.purchasePrice),
+    SellingPrice:  cellNumber(item.sellingPrice),
+    CurrentStock:  cellNumber(item.currentStock),
+    LowStockLevel: cellNumber(item.lowStockLevel),
+    Status:        item.sheetStatus || item.status || 'Active'
   };
-  const row = {};
-  SHEET_COLUMNS.forEach(col => { row[col] = values[col]; });
+}
+
+function categoryFromRow(row) {
+  return {
+    id:          cellText(row.CategoryID),
+    name:        cellText(row.CategoryName),
+    description: cellText(row.Description),
+    status:      cellText(row.Status) || 'Active'
+  };
+}
+
+function categoryToRow(c) {
+  return {
+    CategoryID:   c.id,
+    CategoryName: c.name || '',
+    Description:  c.description || '',
+    Status:       c.status || 'Active'
+  };
+}
+
+function partyFromRow(kind, row) {
+  const supplier = kind === 'supplier';
+  return {
+    id:             cellText(row[supplier ? 'SupplierID' : 'CustomerID']),
+    name:           cellText(row[supplier ? 'SupplierName' : 'CustomerName']),
+    phone:          cellText(row.Phone),
+    email:          cellText(row.Email),
+    address:        cellText(row.Address),
+    gstin:          cellText(row.GSTIN),
+    openingBalance: cellNumber(row.OpeningBalance),
+    balanceType:    cellText(row.BalanceType) || 'Debit',
+    creditLimit:    cellNumber(row.CreditLimit),
+    status:         cellText(row.Status) || 'Active'
+  };
+}
+
+function partyToRow(kind, p) {
+  const supplier = kind === 'supplier';
+  const row = {
+    Phone:          p.phone || '',
+    Email:          p.email || '',
+    Address:        p.address || '',
+    GSTIN:          p.gstin || '',
+    OpeningBalance: cellNumber(p.openingBalance),
+    BalanceType:    p.balanceType || 'Debit',
+    CreditLimit:    cellNumber(p.creditLimit),
+    Status:         p.status || 'Active'
+  };
+  row[supplier ? 'SupplierID' : 'CustomerID'] = p.id;
+  row[supplier ? 'SupplierName' : 'CustomerName'] = p.name || '';
   return row;
 }
 
-/** GET every item. Throws on any failure so callers can fall back. */
-async function apiGetItems() {
-  console.log('[HisabKit API] GET started — ' + API_CONFIG.url);
-
-  let res;
-  try {
-    const sep = API_CONFIG.url.indexOf('?') === -1 ? '?' : '&';
-    res = await apiFetch(API_CONFIG.url + sep + '_=' + Date.now(), {
-      method: 'GET',
-      redirect: 'follow',
-      cache: 'no-store'
-    });
-  } catch (err) {
-    console.error('[HisabKit API] GET failed — network/timeout error:', err);
-    throw err;
-  }
-
-  if (!res.ok) {
-    const err = new Error('HTTP ' + res.status + ' ' + res.statusText);
-    console.error('[HisabKit API] GET failed —', err.message);
-    throw err;
-  }
-
-  let data;
-  try {
-    data = await res.json();
-  } catch (err) {
-    console.error('[HisabKit API] GET failed — response was not valid JSON:', err);
-    throw err;
-  }
-
-  if (!data || data.success !== true || !Array.isArray(data.items)) {
-    const err = new Error('Unexpected response shape: ' + JSON.stringify(data).slice(0, 200));
-    console.error('[HisabKit API] GET failed —', err.message);
-    throw err;
-  }
-
-  console.log('[HisabKit API] GET successful — ' + data.items.length + ' item(s) received');
-  return data.items;
+function purchaseFromRow(row) {
+  return {
+    id:            cellText(row.PurchaseID),
+    billNumber:    cellText(row.BillNo),
+    supplierId:    cellText(row.SupplierID),
+    date:          cellText(row.PurchaseDate),
+    subTotal:      cellNumber(row.SubTotal),
+    taxAmount:     cellNumber(row.TaxAmount),
+    discount:      cellNumber(row.Discount),
+    total:         cellNumber(row.TotalAmount),
+    paid:          cellNumber(row.PaidAmount),
+    balance:       cellNumber(row.DueAmount),
+    paymentStatus: cellText(row.PaymentStatus) || 'Unpaid',
+    notes:         cellText(row.Notes),
+    items:         []
+  };
 }
 
-/** POST one new item. Throws on any failure so callers can fall back. */
-async function apiPostItem(row) {
-  console.log('[HisabKit API] POST started — ' + row.ItemID + ' (' + row.ItemName + ')');
+function purchaseToRow(p) {
+  return {
+    PurchaseID:    p.id,
+    BillNo:        p.billNumber || '',
+    SupplierID:    p.supplierId || '',
+    PurchaseDate:  p.date || todayISO(),
+    SubTotal:      cellNumber(p.subTotal),
+    TaxAmount:     cellNumber(p.taxAmount),
+    Discount:      cellNumber(p.discount),
+    TotalAmount:   cellNumber(p.total),
+    PaidAmount:    cellNumber(p.paid),
+    DueAmount:     cellNumber(p.balance),
+    PaymentStatus: p.paymentStatus || 'Unpaid',
+    Notes:         p.notes || ''
+  };
+}
 
-  let res;
-  try {
-    res = await apiFetch(API_CONFIG.url, {
-      method: 'POST',
-      // text/plain, not application/json: Apps Script does not answer the
-      // CORS preflight, so a JSON content-type would be blocked by the browser.
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(row),
-      redirect: 'follow'
-    });
-  } catch (err) {
-    console.error('[HisabKit API] POST failed — network/timeout error:', err);
-    throw err;
-  }
+function saleFromRow(row) {
+  return {
+    id:            cellText(row.SaleID),
+    invoiceNumber: cellText(row.InvoiceNo),
+    customerId:    cellText(row.CustomerID),
+    date:          cellText(row.SaleDate),
+    subTotal:      cellNumber(row.SubTotal),
+    taxAmount:     cellNumber(row.TaxAmount),
+    discount:      cellNumber(row.Discount),
+    total:         cellNumber(row.TotalAmount),
+    paid:          cellNumber(row.PaidAmount),
+    balance:       cellNumber(row.DueAmount),
+    paymentStatus: cellText(row.PaymentStatus) || 'Unpaid',
+    notes:         cellText(row.Notes),
+    items:         []
+  };
+}
 
-  if (!res.ok) {
-    const err = new Error('HTTP ' + res.status + ' ' + res.statusText);
-    console.error('[HisabKit API] POST failed —', err.message);
-    throw err;
-  }
+function saleToRow(s) {
+  return {
+    SaleID:        s.id,
+    InvoiceNo:     s.invoiceNumber || '',
+    CustomerID:    s.customerId || '',
+    SaleDate:      s.date || todayISO(),
+    SubTotal:      cellNumber(s.subTotal),
+    TaxAmount:     cellNumber(s.taxAmount),
+    Discount:      cellNumber(s.discount),
+    TotalAmount:   cellNumber(s.total),
+    PaidAmount:    cellNumber(s.paid),
+    DueAmount:     cellNumber(s.balance),
+    PaymentStatus: s.paymentStatus || 'Unpaid',
+    Notes:         s.notes || ''
+  };
+}
 
-  const body = await res.text();
-  let data = null;
-  try { data = body ? JSON.parse(body) : null; } catch (err) { data = null; }
+/** A purchase or sale line. `kind` is 'purchase' or 'sale'. */
+function lineFromRow(kind, row) {
+  const buying = kind === 'purchase';
+  return {
+    id:         cellText(row[buying ? 'PurchaseItemID' : 'SaleItemID']),
+    parentId:   cellText(row[buying ? 'PurchaseID' : 'SaleID']),
+    itemId:     cellText(row.ItemID),
+    quantity:   cellNumber(row.Quantity),
+    unit:       cellText(row.Unit),
+    price:      cellNumber(row[buying ? 'PurchasePrice' : 'SellingPrice']),
+    discount:   cellNumber(row.Discount),
+    taxRate:    cellNumber(row.TaxRate),
+    taxAmount:  cellNumber(row.TaxAmount),
+    total:      cellNumber(row.TotalAmount)
+  };
+}
 
-  if (data && data.success === false) {
-    const err = new Error(data.error || data.message || 'The API reported failure');
-    console.error('[HisabKit API] POST failed —', err.message);
-    throw err;
-  }
+function lineToRow(kind, line) {
+  const buying = kind === 'purchase';
+  const row = {
+    ItemID:     line.itemId,
+    Quantity:   cellNumber(line.quantity),
+    Unit:       line.unit || '',
+    Discount:   cellNumber(line.discount),
+    TaxRate:    cellNumber(line.taxRate),
+    TaxAmount:  cellNumber(line.taxAmount),
+    TotalAmount: cellNumber(line.total)
+  };
+  row[buying ? 'PurchaseItemID' : 'SaleItemID'] = line.id;
+  row[buying ? 'PurchaseID' : 'SaleID'] = line.parentId;
+  row[buying ? 'PurchasePrice' : 'SellingPrice'] = cellNumber(line.price);
+  return row;
+}
 
-  console.log('[HisabKit API] POST successful — ' + row.ItemID + ' written to the sheet');
-  return data || { success: true };
+function ledgerFromRow(row) {
+  return {
+    id:          cellText(row.LedgerID),
+    itemId:      cellText(row.ItemID),
+    date:        cellText(row.DateTime),
+    reference:   cellText(row.ReferenceID),
+    type:        cellText(row.TransactionType),
+    quantityIn:  cellNumber(row.QuantityIn),
+    quantityOut: cellNumber(row.QuantityOut),
+    balance:     cellNumber(row.BalanceStock),
+    unit:        cellText(row.Unit),
+    reason:      cellText(row.Notes)
+  };
+}
+
+function ledgerToRow(e) {
+  return {
+    LedgerID:        e.id,
+    ItemID:          e.itemId,
+    DateTime:        e.date || todayISO(),
+    TransactionType: e.type || 'Adjustment',
+    ReferenceID:     e.reference || '',
+    QuantityIn:      cellNumber(e.quantityIn),
+    QuantityOut:     cellNumber(e.quantityOut),
+    BalanceStock:    cellNumber(e.balance),
+    Unit:            e.unit || '',
+    Notes:           e.reason || ''
+  };
+}
+
+function paymentFromRow(row) {
+  return {
+    id:              cellText(row.PaymentID),
+    date:            cellText(row.PaymentDate),
+    partyType:       cellText(row.PartyType) || 'Customer',
+    partyId:         cellText(row.PartyID),
+    referenceType:   cellText(row.ReferenceType),
+    referenceId:     cellText(row.ReferenceID),
+    amount:          cellNumber(row.Amount),
+    paymentMode:     cellText(row.PaymentMode) || 'Cash',
+    transactionType: cellText(row.TransactionType) || 'Received',
+    notes:           cellText(row.Notes)
+  };
+}
+
+function paymentToRow(p) {
+  return {
+    PaymentID:       p.id,
+    PaymentDate:     p.date || todayISO(),
+    PartyType:       p.partyType || 'Customer',
+    PartyID:         p.partyId || '',
+    ReferenceType:   p.referenceType || '',
+    ReferenceID:     p.referenceId || '',
+    Amount:          cellNumber(p.amount),
+    PaymentMode:     p.paymentMode || 'Cash',
+    TransactionType: p.transactionType || 'Received',
+    Notes:           p.notes || ''
+  };
+}
+
+/** Settings rows (SettingKey / SettingValue) -> the app's settings object. */
+function settingsFromRows(rows) {
+  const out = Object.assign({}, DEFAULT_SETTINGS);
+  (rows || []).forEach(row => {
+    const key = cellText(row.SettingKey);
+    const def = SETTING_DEFS.find(d => d.key.toLowerCase() === key.toLowerCase());
+    if (!def) return;
+    const value = cellText(row.SettingValue);
+    out[def.field] = value === '' ? def.fallback : value;
+  });
+  out.lowStockAlert = cellBool(out.lowStockAlert);
+  out.taxEnabled = cellBool(out.taxEnabled);
+  return out;
+}
+
+/** settings object -> Settings rows, one per known key. */
+function settingsToRows(settings) {
+  return SETTING_DEFS.map(def => ({
+    SettingID:   '',
+    SettingKey:  def.key,
+    SettingValue: String(settings[def.field] === undefined ? def.fallback : settings[def.field]),
+    Description: def.label,
+    Status:      'Active'
+  }));
+}
+
+/** Dispatch table: sheet name -> readers, writers and the state array. */
+const SHEET_MAP = {
+  Items:          { stateKey: 'items',      fromRow: itemFromRow,   toRow: itemToRow },
+  Categories:     { stateKey: 'categories', fromRow: categoryFromRow, toRow: categoryToRow },
+  Customers:      { stateKey: 'customers',  fromRow: r => partyFromRow('customer', r), toRow: r => partyToRow('customer', r) },
+  Suppliers:      { stateKey: 'suppliers',  fromRow: r => partyFromRow('supplier', r), toRow: r => partyToRow('supplier', r) },
+  Purchases:      { stateKey: 'purchases',  fromRow: purchaseFromRow, toRow: purchaseToRow },
+  Sales:          { stateKey: 'sales',      fromRow: saleFromRow,     toRow: saleToRow },
+  Stock_Ledger:   { stateKey: 'ledger',     fromRow: ledgerFromRow,   toRow: ledgerToRow },
+  Payments:       { stateKey: 'payments',   fromRow: paymentFromRow,  toRow: paymentToRow },
+  // Document lines have no list of their own: they hang off their parent, so
+  // they are collected from it when the next ID is worked out.
+  Purchase_Items: { stateKey: null, listOf: () => state.purchases.reduce((all, p) => all.concat(p.items || []), []),
+                    fromRow: r => lineFromRow('purchase', r), toRow: l => lineToRow('purchase', l) },
+  Sales_Items:    { stateKey: null, listOf: () => state.sales.reduce((all, s) => all.concat(s.items || []), []),
+                    fromRow: r => lineFromRow('sale', r),     toRow: l => lineToRow('sale', l) },
+  Settings:       { stateKey: null, listOf: () => state.settingRows, fromRow: r => r, toRow: r => r }
+};
+
+/* ---- ID generation --------------------------------------------------
+   The next ID continues the sheet's own sequence: the highest number used so
+   far, plus one. ITM-001 and ITM-002 in the sheet give ITM-003, and an ID that
+   does not follow the pattern (a legacy row) is ignored rather than counted.
+   ------------------------------------------------------------------- */
+
+/** Every record the app currently holds for a sheet, including document lines. */
+function sheetRecords(sheetName) {
+  const map = SHEET_MAP[sheetName];
+  if (!map) return [];
+  if (map.listOf) return map.listOf();
+  return map.stateKey ? (state[map.stateKey] || []) : [];
+}
+
+/** The highest number already used for a sheet's prefix, or 0 if none is. */
+function highestSuffix(sheetName) {
+  const spec = SHEETS[sheetName];
+  if (!spec) return 0;
+
+  const pattern = new RegExp('^' + spec.prefix.replace('-', '\\-') + '(\\d+)$', 'i');
+  let highest = 0;
+  sheetRecords(sheetName).forEach(rec => {
+    const match = pattern.exec(String(rec.id || '').trim());
+    if (match) highest = Math.max(highest, parseInt(match[1], 10));
+  });
+  return highest;
+}
+
+function nextId(sheetName) {
+  const spec = SHEETS[sheetName];
+  if (!spec) return 'ID-' + Date.now().toString(36);
+  return spec.prefix + String(highestSuffix(sheetName) + 1).padStart(3, '0');
 }
 
 /**
- * Replace the local inventory with the sheet's rows.
- * De-duplicates on ItemID, preserves the app-only fields of items we already
- * know, and gives each newly imported item an opening ledger row so that
- * recalculateAllBalances() reconciles to the sheet's CurrentStock rather than
- * forcing it to zero.
+ * A run of consecutive IDs for a sheet, for the rows one save creates at once
+ * (three document lines, two ledger entries). They are handed out from the
+ * current highest number, so none of them collides with another.
  */
-function applySheetItems(rows) {
-  const seen = Object.create(null);
-  const incoming = [];
+function nextIds(sheetName, count) {
+  const spec = SHEETS[sheetName];
+  if (!spec) return [];
 
-  rows.forEach(row => {
-    const item = sheetRowToItem(row);
-    if (!item.id || !item.name) return;   // skip blank or partial rows
-    if (seen[item.id]) return;            // never import the same ItemID twice
-    seen[item.id] = true;
-    incoming.push(item);
+  const start = highestSuffix(sheetName) + 1;
+  const ids = [];
+  for (let i = 0; i < count; i++) ids.push(spec.prefix + String(start + i).padStart(3, '0'));
+  return ids;
+}
+
+/**
+ * Next document number for a bill or invoice, using the prefix configured in
+ * Settings and skipping numbers already used by another record.
+ */
+function nextDocNumber(prefix, existing, field) {
+  const pattern = new RegExp('^' + String(prefix).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&') + '(\\d+)$', 'i');
+  let highest = 0;
+  (existing || []).forEach(rec => {
+    const match = pattern.exec(String(rec[field] || '').trim());
+    if (match) highest = Math.max(highest, parseInt(match[1], 10));
   });
+  return prefix + String(highest + 1).padStart(3, '0');
+}
 
-  // Items created while the sheet was unreachable are not in the sheet yet.
-  // Hold on to them so the user's entry is never silently dropped.
-  const pendingLocals = state.items.filter(i => i.pendingSync);
+/* ---- applying sheet data to state ---- */
 
-  const localById = Object.create(null);
-  state.items.forEach(i => { localById[i.id] = i; });
+/**
+ * Keep the app-only fields of records we already hold. The sheet has no column
+ * for an item's brand, GST rate, supplier or description, so those are read
+ * back from the local copy instead of being blanked on every reload.
+ */
+function mergeLocalExtras(incoming, localList, idField, preserved) {
+  const byId = Object.create(null);
+  (localList || []).forEach(rec => { byId[rec.id] = rec; });
 
-  state.items = incoming.map(item => {
-    const local = localById[item.id];
-    if (!local) return item;              // brand new from the sheet
-    return Object.assign({}, item, {      // known item: keep the local-only fields
-      brand: local.brand || '',
-      gstRate: local.gstRate || 0,
-      supplierId: local.supplierId || '',
-      description: local.description || '',
-      createdAt: local.createdAt || item.createdAt
+  return incoming.map(rec => {
+    const local = byId[rec.id];
+    if (!local) return rec;
+    const merged = Object.assign({}, rec);
+    preserved.forEach(field => {
+      const value = local[field];
+      if (value !== undefined && value !== null && value !== '' && value !== 0) merged[field] = value;
     });
+    if (local.createdAt) merged.createdAt = local.createdAt;
+    return merged;
   });
+}
 
-  // Re-attach the unsynced items. They are absent from the sheet, so this
-  // cannot produce a duplicate.
-  pendingLocals.forEach(p => {
-    if (!state.items.some(i => i.id === p.id)) state.items.push(p);
-  });
+/**
+ * Account for stock the sheet holds but its ledger does not explain.
+ *
+ * The sheet's CurrentStock is authoritative, and the ledger only records what
+ * this app has done since. An item that arrived with 50 in stock and has since
+ * been bought (+5) and sold (-3) has three ledger rows totalling 2, while the
+ * sheet still says 52. Without this, recalculateAllBalances() would trust the
+ * ledger alone and rewrite the item's stock to 2.
+ *
+ * So: for each item, work out what the ledger already accounts for, and if the
+ * sheet shows more, put the difference in front of the ledger as a local
+ * opening entry. Entries are local — they are never written to the sheet, and
+ * they are rebuilt on every read.
+ */
+function ensureOpeningLedger() {
+  const opening = [];
 
   state.items.forEach(item => {
-    const hasHistory = state.ledger.some(l => l.itemId === item.id);
-    if (!hasHistory && item.currentStock > 0) {
-      createLedgerEntry({
-        itemId: item.id,
-        date: todayISO(),
-        reference: 'OPENING',
-        type: 'Adjustment',
-        quantityIn: item.currentStock,
-        quantityOut: 0,
-        reason: 'Opening stock imported from Google Sheet'
-      });
-    }
+    const mine = state.ledger.filter(l => l.itemId === item.id);
+    const net = round2(mine.reduce((total, row) => total + ledgerDelta(row), 0));
+    const gap = round2(item.currentStock - net);
+    if (gap <= 0) return;
+
+    // Date it before the item's earliest real movement, so the running
+    // balance reads in the right order.
+    const dates = mine.map(l => l.date).filter(Boolean).sort();
+    opening.push({
+      id: 'LOCAL-OPENING-' + item.id,
+      itemId: item.id,
+      date: dates.length ? dates[0] : (item.createdAt || todayISO()),
+      reference: 'OPENING',
+      type: 'Opening Stock',
+      quantityIn: gap,
+      quantityOut: 0,
+      balance: item.currentStock,
+      unit: item.unit,
+      reason: 'Opening stock carried in the sheet, not in the ledger',
+      local: true
+    });
   });
+
+  if (opening.length) state.ledger = opening.concat(state.ledger);
+}
+
+/** Apply a full or partial set of sheet rows to state. */
+function applySheetData(data) {
+  const has = name => Object.prototype.hasOwnProperty.call(data, name);
+
+  if (has('Categories')) {
+    state.categories = (data.Categories || []).map(categoryFromRow)
+      .filter(c => c.id || c.name);
+  }
+
+  if (has('Items')) {
+    const incoming = (data.Items || []).map(itemFromRow).filter(i => i.id && i.name);
+    state.items = mergeLocalExtras(incoming, state.items, 'ItemID',
+      ['brand', 'gstRate', 'supplierId', 'description']);
+  }
+
+  if (has('Customers')) {
+    state.customers = (data.Customers || []).map(r => partyFromRow('customer', r)).filter(p => p.name);
+  }
+
+  if (has('Suppliers')) {
+    state.suppliers = (data.Suppliers || []).map(r => partyFromRow('supplier', r)).filter(p => p.name);
+  }
+
+  if (has('Purchases')) {
+    state.purchases = (data.Purchases || []).map(purchaseFromRow).filter(p => p.id || p.billNumber);
+  }
+  if (has('Purchase_Items')) {
+    const lines = (data.Purchase_Items || []).map(r => lineFromRow('purchase', r));
+    state.purchases.forEach(p => { p.items = lines.filter(l => l.parentId === p.id); });
+  }
+
+  if (has('Sales')) {
+    state.sales = (data.Sales || []).map(saleFromRow).filter(s => s.id || s.invoiceNumber);
+  }
+  if (has('Sales_Items')) {
+    const lines = (data.Sales_Items || []).map(r => lineFromRow('sale', r));
+    state.sales.forEach(s => { s.items = lines.filter(l => l.parentId === s.id); });
+  }
+
+  if (has('Stock_Ledger')) {
+    state.ledger = (data.Stock_Ledger || []).map(ledgerFromRow).filter(l => l.id && l.itemId);
+  }
+
+  if (has('Payments')) {
+    state.payments = (data.Payments || []).map(paymentFromRow).filter(p => p.id);
+  }
+
+  if (has('Settings')) {
+    state.settingRows = (data.Settings || []).filter(r => cellText(r.SettingKey));
+    state.settings = settingsFromRows(data.Settings || []);
+  }
+
+  ensureOpeningLedger();
+  recalculateAllBalances();
+  saveData();
 }
 
 /**
- * Load Items from the sheet into state.
- * Returns true when the sheet answered and became the source of inventory,
- * false when it could not be reached (local data is then left untouched).
+ * Startup read. One call returns every tab, so the app talks to Apps Script
+ * once instead of eleven times.
  */
-async function loadItemsFromApi() {
-  let rows;
+async function loadFromApi() {
+  setBusy(true, 'Loading from Google Sheets…');
   try {
-    rows = await apiGetItems();
+    await API.setup();                       // create any missing tab + headers
+    const dump = await API.dump();
+    applySheetData(dump);
+    state.apiOnline = true;
+    state.apiError = '';
+    state.lastSync = new Date().toISOString();
+    await flushPendingWrites();
+    return true;
   } catch (err) {
     state.apiOnline = false;
-    showToast('Google Sheet unavailable — using saved local data.', 'error');
+    state.apiError = describeApiError(err, 'Could not load data from Google Sheets.');
+    console.error('[HisabKit] startup load failed', err);
     return false;
+  } finally {
+    setBusy(false);
+  }
+}
+
+/** Re-read one tab into state (used after a write, or by a Refresh button). */
+async function refreshSheet(sheetName) {
+  const rows = await API.list(sheetName);
+  applySheetData({ [sheetName]: rows });
+  return rows;
+}
+
+/**
+ * Re-read every tab in one call, after a purchase, sale or payment has been
+ * written. The screen then shows exactly what the sheet holds, rather than
+ * what the app thinks it wrote.
+ */
+async function syncAll() {
+  await flushPendingWrites();
+  const dump = await API.dump();
+  applySheetData(dump);
+  state.lastSync = new Date().toISOString();
+  return dump;
+}
+
+/* ---- write-through helpers ---- */
+
+/**
+ * Create a record in the sheet, then mirror it into state. A failure while
+ * offline is queued for master data so the user's entry is never lost.
+ */
+async function repoCreate(sheetName, record) {
+  const map = SHEET_MAP[sheetName];
+  const saved = await API.create(sheetName, map.toRow(record));
+  const local = map.fromRow(saved);
+
+  if (map.stateKey) {
+    state[map.stateKey].push(local);
+    saveData([map.stateKey]);
+  }
+  return local;
+}
+
+async function repoUpdate(sheetName, id, fields) {
+  const map = SHEET_MAP[sheetName];
+  const spec = SHEETS[sheetName];
+  const saved = await API.update(sheetName, spec.idField, id, map.toRow(Object.assign({ id: id }, fields)));
+  const local = map.fromRow(saved);
+
+  if (map.stateKey) {
+    const list = state[map.stateKey];
+    const index = list.findIndex(r => r.id === id);
+    if (index !== -1) list[index] = Object.assign({}, list[index], local);
+    saveData([map.stateKey]);
+  }
+  return local;
+}
+
+async function repoDelete(sheetName, id) {
+  const map = SHEET_MAP[sheetName];
+  const spec = SHEETS[sheetName];
+  await API.remove(sheetName, spec.idField, id);
+  if (map.stateKey) {
+    state[map.stateKey] = state[map.stateKey].filter(r => r.id !== id);
+    saveData([map.stateKey]);
+  }
+}
+
+/** Several writes as one unit — a purchase, a sale or a payment. */
+async function repoTransaction(ops) {
+  const payload = ops.map(op => {
+    const map = SHEET_MAP[op.sheet];
+    if (op.action === 'delete') {
+      return { action: 'delete', sheet: op.sheet, idField: SHEETS[op.sheet].idField, id: op.id };
+    }
+    return {
+      action: op.action,
+      sheet: op.sheet,
+      idField: SHEETS[op.sheet].idField,
+      id: op.id,
+      data: map.toRow(Object.assign({}, op.data, { id: op.id || op.data.id }))
+    };
+  });
+
+  return API.transaction(payload);
+}
+
+/* ---- offline queue for master data ----
+   Only simple creates and updates are queued. A purchase or sale that fails
+   is reported to the user instead, because replaying half of one later would
+   be worse than not saving it.
+   ---------------------------------------------------------------------- */
+
+function readPending() {
+  try {
+    return JSON.parse(localStorage.getItem(PENDING_KEY) || '[]');
+  } catch (err) {
+    return [];
+  }
+}
+
+function writePending(list) {
+  try {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(list));
+  } catch (err) {
+    console.error('HisabKit: could not store the offline queue', err);
+  }
+}
+
+function queueWrite(entry) {
+  const list = readPending();
+  list.push(entry);
+  writePending(list);
+}
+
+/** Push anything created or edited while the sheet was unreachable. */
+async function flushPendingWrites() {
+  const list = readPending();
+  if (!list.length) return;
+
+  console.log('[HisabKit API] pushing ' + list.length + ' change(s) saved while offline');
+  const remaining = [];
+
+  for (const entry of list) {
+    try {
+      if (entry.action === 'create') {
+        await API.create(entry.sheet, entry.data);
+      } else if (entry.action === 'update') {
+        await API.update(entry.sheet, SHEETS[entry.sheet].idField, entry.id, entry.data);
+      }
+    } catch (err) {
+      console.warn('[HisabKit API] still offline — ' + entry.sheet + ' change kept for later', err);
+      remaining.push(entry);
+    }
   }
 
-  if (!rows.length && state.items.length) {
-    // A successful-but-empty read is not "real data" — keep what we have
-    // rather than wiping the catalogue.
-    console.warn('[HisabKit API] GET returned 0 items — keeping the ' +
-                 state.items.length + ' item(s) already stored locally');
-    state.apiOnline = true;
-    return true;
+  writePending(remaining);
+  if (remaining.length !== list.length) {
+    showToast((list.length - remaining.length) + ' offline change(s) synced to Google Sheets');
   }
-
-  state.apiOnline = true;
-  applySheetItems(rows);
-  saveData();
-  await pushPendingItems();          // self-heal anything created while offline
-  return true;
 }
 /* ============================================================
-   5. TOAST NOTIFICATIONS
+   5. TOAST NOTIFICATIONS, BUSY INDICATOR, SYNC BANNER
    ============================================================ */
 function showToast(message, type) {
   const root = document.getElementById('toastRoot');
@@ -1499,6 +1884,61 @@ function showToast(message, type) {
     el.classList.add('leaving');
     setTimeout(() => el.remove(), 200);
   }, 2600);
+}
+
+/**
+ * Loading state for anything that waits on Google Sheets. Reference counted,
+ * so nested calls (a save that re-reads) keep the indicator up until the last
+ * one finishes.
+ */
+let busyDepth = 0;
+
+function setBusy(on, message) {
+  busyDepth = Math.max(0, busyDepth + (on ? 1 : -1));
+  const bar = document.getElementById('syncBar');
+  if (!bar) return;
+
+  if (busyDepth > 0) {
+    bar.classList.add('active');
+    bar.querySelector('.sync-text').textContent = message || 'Working…';
+  } else {
+    bar.classList.remove('active');
+  }
+}
+
+/**
+ * Run an async action with a button disabled and relabelled, so a slow save
+ * cannot be submitted twice.
+ */
+async function withBusyButton(button, busyLabel, fn) {
+  const original = button ? button.innerHTML : null;
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = `<span class="spinner"></span> ${escapeHtml(busyLabel || 'Saving…')}`;
+  }
+  try {
+    return await fn();
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = original;
+    }
+  }
+}
+
+/** A dismissible strip above the page, used when the sheet cannot be reached. */
+function showSyncBanner(message) {
+  const bar = document.getElementById('syncBar');
+  if (!bar) return;
+  bar.classList.add('offline');
+  bar.querySelector('.sync-text').textContent = message;
+}
+
+function clearSyncBanner() {
+  const bar = document.getElementById('syncBar');
+  if (!bar) return;
+  bar.classList.remove('offline');
+  if (busyDepth === 0) bar.classList.remove('active');
 }
 
 /* ============================================================
@@ -1572,9 +2012,19 @@ function confirmDialog(opts) {
         ${escapeHtml(opts.confirmLabel || 'Confirm')}
       </button>`,
     onMount(el) {
-      el.querySelector('#confirmOk').addEventListener('click', () => {
+      el.querySelector('#confirmOk').addEventListener('click', async () => {
+        if (typeof opts.onConfirm !== 'function') { closeModal(); return; }
+
+        const result = opts.onConfirm();
+
+        // A confirm that writes to the sheet keeps the dialog up, with the
+        // button disabled, until the write has finished.
+        if (result && typeof result.then === 'function') {
+          await withBusyButton(el.querySelector('#confirmOk'), opts.busyLabel || 'Working…', () => result);
+          closeModal();
+          return;
+        }
         closeModal();
-        if (typeof opts.onConfirm === 'function') opts.onConfirm();
       });
     }
   });
@@ -1659,29 +2109,43 @@ function recalculateAllBalances() {
 }
 
 /**
- * Create a ledger row and re-sync the affected item's stock.
- * spec: { itemId, date, reference, type, quantityIn, quantityOut, reason }
+ * A Stock_Ledger row expressed as a transaction operation, for the writes that
+ * must land together with an item's stock change.
  */
-function createLedgerEntry(spec) {
-  const entry = {
-    id: generateId('led'),
-    itemId: spec.itemId,
-    date: spec.date || todayISO(),
-    reference: spec.reference || '—',
-    type: spec.type || 'Adjustment',
-    quantityIn: round2(spec.quantityIn || 0),
-    quantityOut: round2(spec.quantityOut || 0),
-    balance: 0,
-    reason: spec.reason || ''
+function ledgerOp(spec) {
+  const item = findItem(spec.itemId);
+  return {
+    action: 'create',
+    sheet: 'Stock_Ledger',
+    id: spec.id || nextId('Stock_Ledger'),
+    data: {
+      itemId: spec.itemId,
+      date: spec.date || todayISO(),
+      reference: spec.reference || '—',
+      type: spec.type || 'Adjustment',
+      quantityIn: round2(spec.quantityIn || 0),
+      quantityOut: round2(spec.quantityOut || 0),
+      balance: round2(spec.balance || 0),
+      unit: spec.unit || (item ? item.unit : ''),
+      reason: spec.reason || ''
+    }
   };
+}
+
+/** Write one Stock_Ledger row on its own, then mirror it into state. */
+async function writeLedgerEntry(spec) {
+  const op = ledgerOp(spec);
+  const saved = await API.create('Stock_Ledger', ledgerToRow(Object.assign({ id: op.id }, op.data)));
+  const entry = ledgerFromRow(saved);
   state.ledger.push(entry);
   sortLedger();
 
-  const item = findItem(spec.itemId);
+  const item = findItem(entry.itemId);
   if (item) {
     item.updatedAt = entry.date;
     applyLedgerBalance(item.id);
   }
+  saveData(['ledger', 'items']);
   return entry;
 }
 
@@ -1694,91 +2158,171 @@ function isSkuTaken(sku, excludeId) {
   );
 }
 
-function saveItem(data) {
+/**
+ * Add an item: one row in the Items sheet, plus an opening Stock_Ledger row
+ * when it starts with stock. The item is only added to the screen after the
+ * sheet has accepted it; if the sheet cannot be reached the change is queued
+ * and pushed on the next successful load.
+ */
+async function createItem(fields) {
   const now = todayISO();
-  const item = {
-    id: generateId('itm'),
-    sku: data.sku || '',
-    name: data.name,
-    category: data.category || '',
-    brand: data.brand || '',
-    unit: data.unit,
-    purchasePrice: round2(data.purchasePrice),
-    sellingPrice: round2(data.sellingPrice),
-    gstRate: Number(data.gstRate) || 0,
-    currentStock: round2(data.openingStock) || 0,
-    openingStock: round2(data.openingStock) || 0,
-    lowStockLevel: round2(data.lowStockLevel) || 0,
-    supplierId: data.supplierId || '',
-    description: data.description || '',
+  const record = {
+    id: nextId('Items'),
+    sku: fields.sku || '',
+    name: fields.name,
+    category: fields.category || '',
+    brand: fields.brand || '',
+    unit: fields.unit,
+    purchasePrice: round2(fields.purchasePrice),
+    sellingPrice: round2(fields.sellingPrice),
+    gstRate: Number(fields.gstRate) || 0,
+    currentStock: round2(fields.openingStock) || 0,
+    openingStock: round2(fields.openingStock) || 0,
+    lowStockLevel: round2(fields.lowStockLevel) || 0,
+    supplierId: fields.supplierId || '',
+    description: fields.description || '',
+    sheetStatus: 'Active',
     createdAt: now,
     updatedAt: now
   };
-  state.items.push(item);
 
-  if (item.openingStock > 0) {
-    createLedgerEntry({
-      itemId: item.id,
-      date: now,
-      reference: 'OPENING',
-      type: 'Adjustment',
-      quantityIn: item.openingStock,
-      quantityOut: 0,
-      reason: 'Opening stock'
+  try {
+    const saved = await API.create('Items', itemToRow(record));
+    // The sheet has no columns for the four extras, so carry them over here.
+    const item = Object.assign(itemFromRow(saved), {
+      brand: record.brand,
+      gstRate: record.gstRate,
+      supplierId: record.supplierId,
+      description: record.description,
+      createdAt: record.createdAt
     });
-  }
+    state.items.push(item);
+    saveData(['items']);
 
-  saveData();
-  return item;
+    if (item.currentStock > 0) {
+      await writeLedgerEntry({
+        itemId: item.id,
+        date: now,
+        reference: 'OPENING',
+        type: 'Opening Stock',
+        quantityIn: item.currentStock,
+        quantityOut: 0,
+        unit: item.unit,
+        balance: item.currentStock,
+        reason: 'Opening stock'
+      });
+    }
+    return item;
+  } catch (err) {
+    console.error('[HisabKit] create item failed', err);
+    // Keep the entry on this device and push it up when the sheet is back.
+    const item = Object.assign({}, record, { pendingSync: true });
+    state.items.push(item);
+    saveData(['items']);
+    queueWrite({ action: 'create', sheet: 'Items', data: itemToRow(item) });
+    throw err;
+  }
 }
 
-function updateItem(id, data) {
+/** Edit an item. A changed opening stock is recorded as a stock correction. */
+async function updateItem(id, fields) {
   const item = findItem(id);
   if (!item) return null;
 
-  const stockDelta = round2((Number(data.openingStock) || 0) - item.openingStock);
-
-  Object.assign(item, {
-    sku: data.sku || '',
-    name: data.name,
-    category: data.category || '',
-    brand: data.brand || '',
-    unit: data.unit,
-    purchasePrice: round2(data.purchasePrice),
-    sellingPrice: round2(data.sellingPrice),
-    gstRate: Number(data.gstRate) || 0,
-    lowStockLevel: round2(data.lowStockLevel) || 0,
-    supplierId: data.supplierId || '',
-    description: data.description || ''
+  const stockDelta = round2((Number(fields.openingStock) || 0) - (Number(item.openingStock) || 0));
+  const next = Object.assign({}, item, {
+    sku: fields.sku || '',
+    name: fields.name,
+    category: fields.category || '',
+    brand: fields.brand || '',
+    unit: fields.unit,
+    purchasePrice: round2(fields.purchasePrice),
+    sellingPrice: round2(fields.sellingPrice),
+    gstRate: Number(fields.gstRate) || 0,
+    lowStockLevel: round2(fields.lowStockLevel) || 0,
+    supplierId: fields.supplierId || '',
+    description: fields.description || '',
+    updatedAt: todayISO()
   });
+  if (stockDelta !== 0) next.currentStock = round2(item.currentStock + stockDelta);
+  next.openingStock = round2(fields.openingStock) || 0;
 
-  // Editing the opening stock is treated as a correction, so the ledger
-  // and the on-hand figure can never drift apart.
+  const ops = [{
+    action: 'update', sheet: 'Items', id: id, data: next
+  }];
+
   if (stockDelta !== 0) {
-    item.openingStock = round2(data.openingStock) || 0;
-    createLedgerEntry({
-      itemId: item.id,
+    ops.push(ledgerOp({
+      itemId: id,
       date: todayISO(),
       reference: 'EDIT',
       type: 'Correction',
       quantityIn: stockDelta > 0 ? stockDelta : 0,
       quantityOut: stockDelta < 0 ? -stockDelta : 0,
+      unit: item.unit,
+      balance: next.currentStock,
       reason: 'Opening stock edited'
-    });
+    }));
   }
 
-  item.updatedAt = todayISO();
-  saveData();
+  await repoTransaction(ops);
+
+  Object.assign(item, next);
+  saveData(['items']);
+
+  if (stockDelta !== 0) {
+    await refreshSheet('Stock_Ledger');
+  }
   return item;
 }
 
-function deleteItem(id) {
+/**
+ * Delete an item — unless transactions depend on it. An item that appears in a
+ * purchase or sale is history and must stay; the user is pointed at Inactive
+ * status instead. The item's own ledger rows go with it.
+ */
+async function deleteItem(id) {
   const item = findItem(id);
   if (!item) return;
+
+  const guard = itemDeleteGuard(id);
+  if (guard.blocked) {
+    showToast(guard.message, 'error');
+    return false;
+  }
+
+  const ledgerIds = state.ledger.filter(l => l.itemId === id && !l.local).map(l => l.id);
+  const ops = ledgerIds.map(lid => ({ action: 'delete', sheet: 'Stock_Ledger', id: lid }));
+  ops.push({ action: 'delete', sheet: 'Items', id: id });
+
+  await repoTransaction(ops);
+
   state.items = state.items.filter(i => i.id !== id);
   state.ledger = state.ledger.filter(l => l.itemId !== id);
   state.inventory.selected.delete(id);
-  saveData();
+  saveData(['items', 'ledger']);
+  return true;
+}
+
+/** Why an item cannot be deleted, if it cannot. */
+function itemDeleteGuard(id) {
+  const lineUses = state.purchases.reduce((n, p) =>
+    n + (p.items || []).filter(l => l.itemId === id).length, 0);
+  const saleUses = state.sales.reduce((n, s) =>
+    n + (s.items || []).filter(l => l.itemId === id).length, 0);
+  const total = lineUses + saleUses;
+
+  if (!total) return { blocked: false };
+
+  const parts = [];
+  if (lineUses) parts.push(lineUses + ' purchase line' + (lineUses === 1 ? '' : 's'));
+  if (saleUses) parts.push(saleUses + ' sales line' + (saleUses === 1 ? '' : 's'));
+
+  return {
+    blocked: true,
+    message: 'This item is used by ' + parts.join(' and ') +
+             '. Mark it Inactive instead of deleting it.'
+  };
 }
 
 /* ---- Stock adjustment ---- */
@@ -1786,7 +2330,7 @@ function deleteItem(id) {
  * type: 'Stock In' | 'Stock Out' | 'Damage' | 'Correction'
  * For Correction, `quantity` is the corrected on-hand figure.
  */
-function adjustStock(spec) {
+async function adjustStock(spec) {
   const item = findItem(spec.itemId);
   if (!item) return { ok: false, message: 'Item not found' };
 
@@ -1815,17 +2359,33 @@ function adjustStock(spec) {
     return { ok: false, message: 'Unknown adjustment type' };
   }
 
-  createLedgerEntry({
-    itemId: item.id,
-    date: spec.date || todayISO(),
-    reference: spec.reference || 'ADJ',
-    type: ledgerType,
-    quantityIn: qIn,
-    quantityOut: qOut,
-    reason: spec.reason || spec.type
-  });
+  const newStock = round2(item.currentStock + qIn - qOut);
 
-  saveData();
+  try {
+    await repoTransaction([
+      { action: 'update', sheet: 'Items', id: item.id,
+        data: Object.assign({}, item, { currentStock: newStock, updatedAt: todayISO() }) },
+      ledgerOp({
+        itemId: item.id,
+        date: spec.date || todayISO(),
+        reference: spec.reference || 'ADJ',
+        type: ledgerType,
+        quantityIn: qIn,
+        quantityOut: qOut,
+        unit: item.unit,
+        balance: newStock,
+        reason: spec.reason || spec.type
+      })
+    ]);
+  } catch (err) {
+    console.error('[HisabKit] stock adjustment failed', err);
+    return { ok: false, message: describeApiError(err, 'The adjustment could not be saved.') };
+  }
+
+  item.currentStock = newStock;
+  item.updatedAt = todayISO();
+  await refreshSheet('Stock_Ledger');
+  saveData(['items', 'ledger']);
   return { ok: true };
 }
 
@@ -1843,47 +2403,115 @@ function purchaseStatus(p) {
   return 'Unpaid';
 }
 
+/** The Payments module's PaymentMode, derived from the form's payment type. */
+function paymentModeFrom(paymentType) {
+  const map = { Cash: 'Cash', Bank: 'Bank Transfer', UPI: 'UPI', Credit: 'Credit', Card: 'Card', Cheque: 'Cheque' };
+  return map[paymentType] || 'Cash';
+}
+
 /**
- * Persist a purchase: stock in for every line, ledger entry per line,
- * then the purchase record itself.
- * form: { supplierId, billNumber, date, items[], subtotal, discount, tax,
- *         roundOff, total, paid, paymentType }
+ * A Payments row for a bill or invoice settled in full or in part.
+ * kind: 'purchase' (money paid out) | 'sale' (money received).
  */
-function savePurchase(form) {
-  const purchase = {
-    id: generateId('pur'),
-    supplierId: form.supplierId,
-    billNumber: form.billNumber || `PUR-${String(state.purchases.length + 1025)}`,
-    date: form.date || todayISO(),
-    items: form.items,
-    subtotal: round2(form.subtotal),
-    discount: round2(form.discount || 0),
-    tax: round2(form.tax),
-    roundOff: round2(form.roundOff || 0),
-    total: round2(form.total),
-    paid: round2(form.paid || 0),
-    balance: round2(form.total - (form.paid || 0)),
-    paymentType: form.paymentType || 'Cash',
-    createdAt: new Date().toISOString()
+function settlementOp(kind, doc, referenceField) {
+  return {
+    action: 'create',
+    sheet: 'Payments',
+    id: nextId('Payments'),
+    data: {
+      date: doc.date,
+      partyType: kind === 'purchase' ? 'Supplier' : 'Customer',
+      partyId: kind === 'purchase' ? doc.supplierId : doc.customerId,
+      referenceType: kind === 'purchase' ? 'Purchase' : 'Sale',
+      referenceId: doc.id,
+      amount: round2(doc.paid),
+      paymentMode: paymentModeFrom(doc.paymentType),
+      transactionType: kind === 'purchase' ? 'Paid' : 'Received',
+      notes: 'Against ' + (doc[referenceField] || doc.id)
+    }
   };
+}
 
-  state.purchases.push(purchase);
+/**
+ * Persist a purchase bill and everything that hangs off it as one write: the
+ * Purchases row, one Purchase_Items row per line, the stock increase on each
+ * item, a Stock_Ledger row per line, and a Payments row when part of the bill
+ * was paid.
+ *
+ * Apps Script applies the whole batch or none of it, so a failure part way
+ * through leaves the sheet exactly as it was — the bill header can never be
+ * saved without its lines.
+ *
+ * form: { supplierId, billNumber, date, items[], subtotal, discount, tax,
+ *         roundOff, total, paid, paymentType, notes }
+ * Returns { ok, message, purchase }.
+ */
+async function savePurchase(form) {
+  const lines = (form.items || []).filter(li => li.itemId && li.quantity > 0);
+  if (!lines.length) return { ok: false, message: 'Add at least one item with a quantity.' };
+  if (!form.supplierId) return { ok: false, message: 'Please select a supplier.' };
 
-  purchase.items.forEach(li => {
-    if (!findItem(li.itemId)) return;
-    createLedgerEntry({
-      itemId: li.itemId,
-      date: purchase.date,
-      reference: purchase.billNumber,
-      type: 'Purchase',
-      quantityIn: li.quantity,
-      quantityOut: 0,
-      reason: 'New purchase'
+  for (const li of lines) {
+    if (!findItem(li.itemId)) return { ok: false, message: 'An item on this bill is no longer in your inventory.' };
+  }
+
+  const paid = round2(form.paid || 0);
+  const purchase = {
+    id: nextId('Purchases'),
+    supplierId: form.supplierId,
+    billNumber: form.billNumber,
+    date: form.date || todayISO(),
+    subTotal: round2(form.subtotal),
+    discount: round2(form.discount || 0),
+    taxAmount: round2(form.tax),
+    total: round2(form.total),
+    paid: paid,
+    balance: round2(form.total - paid),
+    paymentStatus: '',
+    notes: form.notes || '',
+    paymentType: form.paymentType || 'Cash',
+    items: []
+  };
+  purchase.paymentStatus = purchaseStatus(purchase);
+
+  const lineIds = nextIds('Purchase_Items', lines.length);
+  const ledgerIds = nextIds('Stock_Ledger', lines.length);
+  const ops = [{ action: 'create', sheet: 'Purchases', id: purchase.id, data: purchase }];
+
+  lines.forEach((li, i) => {
+    const item = findItem(li.itemId);
+    const newStock = round2(item.currentStock + li.quantity);
+
+    const line = {
+      id: lineIds[i], parentId: purchase.id, itemId: li.itemId, quantity: round2(li.quantity),
+      unit: li.unit || item.unit, price: round2(li.price), discount: round2(li.discount || 0),
+      taxRate: round2(li.gstRate), taxAmount: round2(li.taxAmount), total: round2(li.amount),
+      name: item.name
+    };
+    purchase.items.push(line);
+    ops.push({ action: 'create', sheet: 'Purchase_Items', id: line.id, data: line });
+
+    ops.push({
+      action: 'update', sheet: 'Items', id: item.id,
+      data: Object.assign({}, item, { currentStock: newStock })
     });
+    ops.push(ledgerOp({
+      id: ledgerIds[i], itemId: item.id, date: purchase.date, reference: purchase.billNumber,
+      type: 'Purchase', quantityIn: li.quantity, quantityOut: 0, balance: newStock,
+      unit: li.unit || item.unit, reason: 'Purchase bill ' + purchase.billNumber
+    }));
   });
 
-  saveData();
-  return purchase;
+  if (paid > 0) ops.push(settlementOp('purchase', purchase, 'billNumber'));
+
+  try {
+    await repoTransaction(ops);
+    await syncAll();
+    return { ok: true, purchase };
+  } catch (err) {
+    console.error('[HisabKit] purchase save failed', err);
+    return { ok: false, message: describeApiError(err, 'Purchase could not be saved.') };
+  }
 }
 
 /* ---- Sales ---- */
@@ -1895,55 +2523,142 @@ function getSalesStats(sales) {
 }
 
 /**
- * Persist a sale. Refuses to oversell any line.
- * Returns { ok, message, sale }
+ * Persist a sales invoice and everything that hangs off it as one write: the
+ * Sales row, one Sales_Items row per line, the stock reduction on each item, a
+ * Stock_Ledger row per line, and a Payments row when part of the invoice was
+ * received.
+ *
+ * Stock is checked line by line before anything is written, and the batch is
+ * all-or-nothing, so an invoice can never take stock below zero.
+ *
+ * Returns { ok, message, sale }.
  */
-function saveSale(form) {
-  // Validate stock first so we never half-apply a sale
-  for (const li of form.items) {
+async function saveSale(form) {
+  const lines = (form.items || []).filter(li => li.itemId && li.quantity > 0);
+  if (!lines.length) return { ok: false, message: 'Add at least one item with a quantity.' };
+  if (!form.customerId) return { ok: false, message: 'Please select a customer.' };
+
+  // Validate every line first, so nothing is written when one of them fails.
+  const stockNeeded = {};
+  for (const li of lines) {
     const item = findItem(li.itemId);
-    if (!item) return { ok: false, message: 'An item on this invoice no longer exists' };
-    if (li.quantity > item.currentStock) {
+    if (!item) return { ok: false, message: 'An item on this invoice is no longer in your inventory.' };
+    stockNeeded[item.id] = round2((stockNeeded[item.id] || 0) + li.quantity);
+    if (stockNeeded[item.id] > item.currentStock) {
       return {
         ok: false,
-        message: `Not enough stock for ${item.name} — only ${formatNumber(item.currentStock)} ${item.unit} available`
+        message: `Insufficient stock for ${item.name} — only ${formatNumber(item.currentStock)} ${item.unit} available.`
       };
     }
   }
 
+  const paid = round2(form.paid || 0);
   const sale = {
-    id: generateId('sal'),
+    id: nextId('Sales'),
     customerId: form.customerId,
-    invoiceNumber: form.invoiceNumber || `INV-${String(state.sales.length + 2042)}`,
+    invoiceNumber: form.invoiceNumber,
     date: form.date || todayISO(),
-    items: form.items,
-    subtotal: round2(form.subtotal),
+    subTotal: round2(form.subtotal),
     discount: round2(form.discount || 0),
-    tax: round2(form.tax),
-    roundOff: round2(form.roundOff || 0),
+    taxAmount: round2(form.tax),
     total: round2(form.total),
-    paid: round2(form.paid || 0),
-    balance: round2(form.total - (form.paid || 0)),
+    paid: paid,
+    balance: round2(form.total - paid),
+    paymentStatus: '',
+    notes: form.notes || '',
     paymentType: form.paymentType || 'Cash',
-    createdAt: new Date().toISOString()
+    items: []
   };
+  sale.paymentStatus = purchaseStatus(sale);
 
-  state.sales.push(sale);
+  const lineIds = nextIds('Sales_Items', lines.length);
+  const ledgerIds = nextIds('Stock_Ledger', lines.length);
+  const ops = [{ action: 'create', sheet: 'Sales', id: sale.id, data: sale }];
 
-  sale.items.forEach(li => {
-    createLedgerEntry({
-      itemId: li.itemId,
-      date: sale.date,
-      reference: sale.invoiceNumber,
-      type: 'Sale',
-      quantityIn: 0,
-      quantityOut: li.quantity,
-      reason: 'Customer sale'
+  lines.forEach((li, i) => {
+    const item = findItem(li.itemId);
+    const newStock = round2(item.currentStock - li.quantity);
+
+    const line = {
+      id: lineIds[i], parentId: sale.id, itemId: li.itemId, quantity: round2(li.quantity),
+      unit: li.unit || item.unit, price: round2(li.price), discount: round2(li.discount || 0),
+      taxRate: round2(li.gstRate), taxAmount: round2(li.taxAmount), total: round2(li.amount),
+      name: item.name
+    };
+    sale.items.push(line);
+    ops.push({ action: 'create', sheet: 'Sales_Items', id: line.id, data: line });
+
+    ops.push({
+      action: 'update', sheet: 'Items', id: item.id,
+      data: Object.assign({}, item, { currentStock: newStock })
     });
+    ops.push(ledgerOp({
+      id: ledgerIds[i], itemId: item.id, date: sale.date, reference: sale.invoiceNumber,
+      type: 'Sale', quantityIn: 0, quantityOut: li.quantity, balance: newStock,
+      unit: li.unit || item.unit, reason: 'Sales invoice ' + sale.invoiceNumber
+    }));
   });
 
-  saveData();
-  return { ok: true, sale };
+  if (paid > 0) ops.push(settlementOp('sale', sale, 'invoiceNumber'));
+
+  try {
+    await repoTransaction(ops);
+    await syncAll();
+    return { ok: true, sale };
+  } catch (err) {
+    console.error('[HisabKit] sale save failed', err);
+    return { ok: false, message: describeApiError(err, 'Invoice could not be saved.') };
+  }
+}
+
+/**
+ * Record money received against an invoice, or paid against a bill.
+ *
+ * The Payments row and the document's PaidAmount, DueAmount and PaymentStatus
+ * are written as one batch, so the payments list and the bill can never
+ * disagree about how much is still owed.
+ *
+ * Returns { ok, message }.
+ */
+async function recordSettlement(kind, docId, amount, paymentMode, date) {
+  const buying = kind === 'purchase';
+  const list = buying ? state.purchases : state.sales;
+  const doc = list.find(d => d.id === docId);
+  if (!doc) return { ok: false, message: 'That document is no longer loaded. Reload the page and try again.' };
+
+  const amt = round2(amount);
+  if (!(amt > 0)) return { ok: false, message: 'Enter an amount greater than zero.' };
+  if (amt > round2(doc.balance)) {
+    return { ok: false, message: 'The amount cannot be more than the balance due of ' + formatCurrency(doc.balance) + '.' };
+  }
+
+  const paid = round2(doc.paid + amt);
+  const updated = Object.assign({}, doc, { paid: paid, balance: round2(doc.total - paid) });
+  updated.paymentStatus = purchaseStatus(updated);
+
+  const ops = [
+    { action: 'update', sheet: buying ? 'Purchases' : 'Sales', id: doc.id, data: updated },
+    { action: 'create', sheet: 'Payments', id: nextId('Payments'), data: {
+        date: date || todayISO(),
+        partyType: buying ? 'Supplier' : 'Customer',
+        partyId: buying ? doc.supplierId : doc.customerId,
+        referenceType: buying ? 'Purchase' : 'Sale',
+        referenceId: doc.id,
+        amount: amt,
+        paymentMode: paymentMode || 'Cash',
+        transactionType: buying ? 'Paid' : 'Received',
+        notes: 'Against ' + (buying ? doc.billNumber : doc.invoiceNumber)
+    } }
+  ];
+
+  try {
+    await repoTransaction(ops);
+    await syncAll();
+    return { ok: true };
+  } catch (err) {
+    console.error('[HisabKit] settlement failed', err);
+    return { ok: false, message: describeApiError(err, 'The payment could not be recorded.') };
+  }
 }
 
 /* ---- Dashboard roll-ups ---- */
@@ -1962,6 +2677,10 @@ function getDashboardStats() {
     todaySales, todayPurchases, monthSales,
     inventoryValue: calculateInventoryValue(),
     receivables, payables,
+    totalSales: round2(sum(state.sales, s => s.total)),
+    totalPurchases: round2(sum(state.purchases, p => p.total)),
+    customerCount: state.customers.length,
+    supplierCount: state.suppliers.length,
     stock: getStockStats()
   };
 }
@@ -2004,7 +2723,8 @@ const NAV = [
     { route:'customers', label:'Customers' },
     { route:'suppliers', label:'Suppliers' }
   ]},
-  { route:'cash-bank', label:'Cash & Bank', icon:'wallet' },
+  { route:'payments',  label:'Payments',    icon:'wallet' },
+  { route:'cash-bank', label:'Cash & Bank', icon:'building' },
   { route:'reports',   label:'Reports',     icon:'chart' },
   { route:'settings',  label:'Settings',    icon:'settings' }
 ];
@@ -2021,6 +2741,7 @@ const ROUTE_META = {
   'purchase-returns': { title:'Purchase Returns', crumb:'Home / Purchases / Purchase Returns' },
   'customers':        { title:'Customers',        crumb:'Home / Parties / Customers' },
   'suppliers':        { title:'Suppliers',        crumb:'Home / Parties / Suppliers' },
+  'payments':         { title:'Payments',         crumb:'Home / Payments' },
   'cash-bank':        { title:'Cash & Bank',      crumb:'Home / Cash & Bank' },
   'reports':          { title:'Reports',          crumb:'Home / Reports' },
   'settings':         { title:'Settings',         crumb:'Home / Settings' }
@@ -2137,9 +2858,16 @@ function statCard(opts) {
     </div>`;
 }
 
+/** Category choices come from the Categories sheet; items are only a fallback. */
 function categoryOptions(selected, includeAll) {
-  const cats = Array.from(new Set(state.items.map(i => i.category).filter(Boolean))).sort();
-  const all = cats.length ? cats : DEFAULT_CATEGORIES;
+  const fromSheet = state.categories
+    .filter(c => (c.status || 'Active').toLowerCase() !== 'inactive')
+    .map(c => c.name)
+    .filter(Boolean);
+
+  const usedByItems = state.items.map(i => i.category).filter(Boolean);
+  const all = Array.from(new Set(fromSheet.concat(usedByItems))).sort();
+
   return (includeAll ? `<option value="">All Categories</option>` : '') +
     all.map(c => `<option value="${escapeHtml(c)}" ${selected === c ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('');
 }
@@ -2601,19 +3329,34 @@ function bindInventoryEvents() {
 function confirmDeleteItem(id) {
   const item = findItem(id);
   if (!item) return;
-  const ledgerCount = state.ledger.filter(l => l.itemId === id).length;
+
+  const guard = itemDeleteGuard(id);
+  const ledgerCount = state.ledger.filter(l => l.itemId === id && !l.local).length;
 
   confirmDialog({
     title: 'Delete item',
-    message: `Delete <strong>${escapeHtml(item.name)}</strong> (${escapeHtml(item.sku || 'no SKU')})?`
-      + (ledgerCount ? `<br><br>This also removes <strong>${ledgerCount}</strong> stock ledger entr${ledgerCount > 1 ? 'ies' : 'y'}.` : '')
-      + `<br><br>This cannot be undone.`,
-    confirmLabel: 'Delete',
-    danger: true,
-    onConfirm() {
-      deleteItem(id);
-      renderInventory();
-      showToast('Item deleted successfully');
+    message: guard.blocked
+      ? `<strong>${escapeHtml(item.name)}</strong> cannot be deleted.`
+        + `<br><br>${escapeHtml(guard.message)}`
+      : `Delete <strong>${escapeHtml(item.name)}</strong> (${escapeHtml(item.sku || 'no SKU')})?`
+        + (ledgerCount ? `<br><br>This also removes <strong>${ledgerCount}</strong> stock ledger entr${ledgerCount > 1 ? 'ies' : 'y'} from the sheet.` : '')
+        + `<br><br>This cannot be undone.`,
+    confirmLabel: guard.blocked ? 'Close' : 'Delete',
+    danger: !guard.blocked,
+    async onConfirm() {
+      if (guard.blocked) return;
+      await withBusyButton(null, '', async () => {
+        try {
+          const done = await deleteItem(id);
+          if (done) {
+            renderInventory();
+            showToast('Item deleted successfully');
+          }
+        } catch (err) {
+          console.error('[HisabKit] delete item failed', err);
+          showToast(describeApiError(err, 'The item could not be deleted.'), 'error');
+        }
+      });
     }
   });
 }
@@ -2805,108 +3548,31 @@ function submitItemForm(form, itemId) {
     showToast('Quantity cannot be negative', 'error'); return;
   }
 
-  // Editing stays local for now — this phase of the API defines GET and POST only.
-  if (itemId) {
-    updateItem(itemId, data);
-    showToast('Item updated successfully');
-    closeModal();
-    render();
-    return;
-  }
-
-  addItemViaApi(form, data);
-}
-
-/**
- * Add New Item: POST to the Google Sheet, then re-read Inventory from it.
- * localStorage is written only when the POST fails, so the sheet stays the
- * source of truth whenever it is reachable.
- */
-async function addItemViaApi(form, data) {
   const submitBtn = form.querySelector('button[type="submit"]');
-  if (submitBtn) submitBtn.disabled = true;
 
-  // (a) a unique ItemID, and (b) the row in the sheet's exact column names
-  const row = itemToSheetRow({
-    id: generateId('itm'),
-    sku: data.sku,
-    name: data.name,
-    category: data.category,
-    unit: data.unit,
-    purchasePrice: data.purchasePrice,
-    sellingPrice: data.sellingPrice,
-    currentStock: round2(data.openingStock) || 0,
-    lowStockLevel: data.lowStockLevel,
-    sheetStatus: 'Active'
-  });
-
-  try {
-    await apiPostItem(row);              // (c) POST it
-
-    const refreshed = await loadItemsFromApi();   // (d) re-read Inventory
-
-    if (!refreshed) {
-      // The write landed but the re-read did not. Keep it visible under the
-      // SAME ItemID so a later GET replaces it instead of duplicating it.
-      keepPostedItemLocally(row);
-    }
-
-    closeModal();
-    render();
-    showToast('Item added successfully');        // (e) success message
-  } catch (err) {
-    // (f) POST failed — fall back to localStorage so the entry is not lost.
-    // Flagged so the next successful load can push it up and it is never
-    // mistaken for a sheet row.
-    const item = saveItem(data);
-    item.source = 'local';
-    item.pendingSync = true;
-    saveData();
-
-    closeModal();
-    render();
-    showToast('Google Sheet unreachable — item saved on this device only.', 'error');
-  } finally {
-    if (submitBtn) submitBtn.disabled = false;
-  }
-}
-
-/** Keep a successfully POSTed item visible when the follow-up GET failed. */
-function keepPostedItemLocally(row) {
-  const item = sheetRowToItem(row);
-  if (state.items.some(i => i.id === item.id)) return;
-  state.items.push(item);
-  if (item.currentStock > 0) {
-    createLedgerEntry({
-      itemId: item.id,
-      date: todayISO(),
-      reference: 'OPENING',
-      type: 'Adjustment',
-      quantityIn: item.currentStock,
-      quantityOut: 0,
-      reason: 'Opening stock imported from Google Sheet'
-    });
-  }
-  saveData();
-}
-
-/** Push up any items that were created while the sheet was unreachable. */
-async function pushPendingItems() {
-  const pending = state.items.filter(i => i.pendingSync);
-  if (!pending.length) return;
-
-  console.log('[HisabKit API] retrying ' + pending.length + ' item(s) saved while offline');
-  for (const item of pending) {
+  withBusyButton(submitBtn, itemId ? 'Updating…' : 'Saving…', async () => {
     try {
-      await apiPostItem(itemToSheetRow(item));
-      delete item.pendingSync;
-      delete item.source;
+      if (itemId) {
+        await updateItem(itemId, data);
+        showToast('Item updated successfully');
+      } else {
+        await createItem(data);
+        showToast('Item added successfully');
+      }
+      closeModal();
+      render();
     } catch (err) {
-      console.warn('[HisabKit API] still offline — ' + item.id + ' remains unsynced');
-      break;                                  // still down; try again next load
+      console.error('[HisabKit] saving item failed', err);
+      if (!itemId) {
+        // createItem() already kept the entry on this device and queued it.
+        closeModal();
+        render();
+        showToast('Google Sheets unreachable — item saved on this device and will sync later.', 'error');
+        return;
+      }
+      showToast(describeApiError(err, 'The item could not be updated.'), 'error');
     }
-  }
-  saveData();
+  });
 }
 
 /** Read-only detail view with recent stock movements. */
@@ -3095,12 +3761,15 @@ function openStockAdjustment(itemId, presetType) {
         if (spec.quantity === '' || spec.quantity === null) { fail('quantity'); return; }
         if (!spec.reason) { fail('reason'); showToast('Please fill all required fields', 'error'); return; }
 
-        const res = adjustStock(spec);
-        if (!res.ok) { showToast(res.message, 'error'); return; }
+        const button = form.closest('.modal') ? form.closest('.modal').querySelector('.modal-foot button[type="submit"]') : null;
+        withBusyButton(button, 'Updating stock…', async () => {
+          const res = await adjustStock(spec);
+          if (!res.ok) { showToast(res.message, 'error'); return; }
 
-        closeModal();
-        showToast('Stock updated successfully');
-        render();
+          closeModal();
+          showToast('Stock updated successfully');
+          render();
+        });
       });
     }
   });
@@ -3309,10 +3978,11 @@ function openTransactionForm(kind) {
   const dateLabel   = isPurchase ? 'Bill Date' : 'Invoice Date';
   const partyList   = isPurchase ? state.suppliers : state.customers;
 
-  // Prefill a sensible next document number
+  // Prefill the next document number from the prefix set in Settings, skipping
+  // any number the sheet has already used.
   const nextNumber = isPurchase
-    ? `PUR-${1025 + state.purchases.length}`
-    : `INV-${2042 + state.sales.length}`;
+    ? nextDocNumber(state.settings.purchasePrefix || 'PUR-', state.purchases, 'billNumber')
+    : nextDocNumber(state.settings.invoicePrefix || 'INV-', state.sales, 'invoiceNumber');
 
   const partyOpts = partyList.length
     ? `<option value="">Select ${partyLabel.toLowerCase()}…</option>` +
@@ -3381,7 +4051,7 @@ function openTransactionForm(kind) {
             <div class="field" data-field="paid">
               <label for="tPaid">Paid Amount</label>
               <div class="input-affix">
-                <span class="prefix">₹</span>
+                <span class="prefix">${currencySymbol()}</span>
                 <input class="input" id="tPaid" name="paid" type="number" min="0" step="0.01" value="0">
               </div>
               <span class="err">Paid amount cannot exceed the total</span>
@@ -3392,6 +4062,11 @@ function openTransactionForm(kind) {
                 <span class="k">Total − Paid</span>
                 <span class="v" id="tBalance" style="font-size:15px;">${formatCurrency(0)}</span>
               </div>
+            </div>
+            <div class="field">
+              <label for="tNotes">Notes</label>
+              <input class="input" id="tNotes" name="notes" autocomplete="off"
+                     placeholder="${isPurchase ? 'Supplier bill reference…' : 'Delivery or order note…'}">
             </div>
           </div>
 
@@ -3569,7 +4244,7 @@ function openTransactionForm(kind) {
       });
 
       /* ---- submit ---- */
-      form.addEventListener('submit', e => {
+      form.addEventListener('submit', async e => {
         e.preventDefault();
         form.querySelectorAll('.field').forEach(f => f.classList.remove('invalid'));
 
@@ -3613,26 +4288,31 @@ function openTransactionForm(kind) {
           total: summary.total,
           paid: summary.paid,
           paymentType: el.querySelector('#tPayType').value,
+          notes: el.querySelector('#tNotes').value.trim(),
           date: el.querySelector('#tDate').value || todayISO()
         };
 
         if (isPurchase) {
           payload.supplierId = partySel.value;
           payload.billNumber = el.querySelector('#tNumber').value.trim() || nextNumber;
-          savePurchase(payload);
-          closeModal();
-          showToast('Purchase saved successfully');
-          state.route = 'purchase-bills';
         } else {
           payload.customerId = partySel.value;
           payload.invoiceNumber = el.querySelector('#tNumber').value.trim() || nextNumber;
-          const res = saveSale(payload);
-          if (!res.ok) { showToast(res.message, 'error'); return; }
-          closeModal();
-          showToast('Invoice saved successfully');
-          state.route = 'sales-invoices';
         }
 
+        const submitBtn = document.querySelector('.modal-foot [form="txnForm"]');
+        const saved = await withBusyButton(submitBtn,
+          isPurchase ? 'Saving purchase…' : 'Saving invoice…',
+          () => (isPurchase ? savePurchase(payload) : saveSale(payload)));
+
+        if (!saved.ok) {
+          showToast(saved.message, 'error');
+          return;
+        }
+
+        closeModal();
+        showToast(isPurchase ? 'Purchase saved successfully' : 'Invoice saved successfully');
+        state.route = isPurchase ? 'purchase-bills' : 'sales-invoices';
         renderSidebar();
         render();
       });
@@ -3885,13 +4565,17 @@ function openRecordPayment(purchaseId) {
       </div>
       <form id="payForm">
         <div class="field" data-field="amount">
-          <label for="payAmount">Amount Received <span class="req">*</span></label>
+          <label for="payAmount">Amount Paid <span class="req">*</span></label>
           <div class="input-affix">
-            <span class="prefix">₹</span>
+            <span class="prefix">${currencySymbol()}</span>
             <input class="input" id="payAmount" name="amount" type="number" min="0" step="0.01"
                    max="${p.balance}" value="${p.balance}" autofocus>
           </div>
           <span class="err">Enter an amount between 0 and ${formatCurrency(p.balance)}</span>
+        </div>
+        <div class="field">
+          <label for="payMode">Payment Mode</label>
+          <select class="select" id="payMode">${PAYMENT_MODES.map(m => `<option value="${m}">${m}</option>`).join('')}</select>
         </div>
       </form>`,
     footer: `
@@ -3900,10 +4584,11 @@ function openRecordPayment(purchaseId) {
     onMount(el) {
       const form = el.querySelector('#payForm');
       const input = el.querySelector('#payAmount');
+      const mode = el.querySelector('#payMode');
       input.focus();
       input.select();
 
-      form.addEventListener('submit', e => {
+      form.addEventListener('submit', async e => {
         e.preventDefault();
         const amt = round2(Number(input.value) || 0);
         const wrap = form.querySelector('[data-field="amount"]');
@@ -3911,9 +4596,12 @@ function openRecordPayment(purchaseId) {
 
         if (amt <= 0 || amt > p.balance) { wrap.classList.add('invalid'); return; }
 
-        p.paid = round2(p.paid + amt);
-        p.balance = round2(p.total - p.paid);
-        saveData(['purchases']);
+        const btn = document.querySelector('.modal-foot [form="payForm"]');
+        const res = await withBusyButton(btn, 'Recording…',
+          () => recordSettlement('purchase', purchaseId, amt, mode.value, todayISO()));
+
+        if (!res.ok) { showToast(res.message, 'error'); return; }
+
         closeModal();
         showToast('Payment recorded successfully');
         render();
@@ -3934,14 +4622,43 @@ function confirmDeletePurchase(id) {
       + (ledgerCount ? ` (${ledgerCount} ledger entr${ledgerCount > 1 ? 'ies' : 'y'} removed)` : '')
       + `.<br><br>This cannot be undone.`,
     confirmLabel: 'Delete',
+    busyLabel: 'Deleting…',
     danger: true,
-    onConfirm() {
-      state.ledger = state.ledger.filter(l => !(l.reference === p.billNumber && l.type === 'Purchase'));
-      state.purchases = state.purchases.filter(x => x.id !== id);
-      recalculateAllBalances();
-      saveData();
-      renderPurchaseBills();
-      showToast('Purchase deleted successfully');
+    async onConfirm() {
+      const ops = [];
+
+      // Give back the stock this bill added, then remove every trace of it.
+      (p.items || []).forEach(line => {
+        const item = findItem(line.itemId);
+        if (!item) return;
+        ops.push({
+          action: 'update', sheet: 'Items', id: item.id,
+          data: Object.assign({}, item, { currentStock: round2(item.currentStock - line.quantity) })
+        });
+      });
+
+      state.ledger
+        .filter(l => l.type === 'Purchase' && l.reference === p.billNumber)
+        .forEach(l => ops.push({ action: 'delete', sheet: 'Stock_Ledger', id: l.id }));
+
+      (p.items || []).forEach(line =>
+        ops.push({ action: 'delete', sheet: 'Purchase_Items', id: line.id }));
+
+      state.payments
+        .filter(pay => pay.referenceType === 'Purchase' && pay.referenceId === p.id)
+        .forEach(pay => ops.push({ action: 'delete', sheet: 'Payments', id: pay.id }));
+
+      ops.push({ action: 'delete', sheet: 'Purchases', id: p.id });
+
+      try {
+        await repoTransaction(ops);
+        await syncAll();
+        renderPurchaseBills();
+        showToast('Purchase deleted and stock returned');
+      } catch (err) {
+        console.error('[HisabKit] purchase delete failed', err);
+        showToast(describeApiError(err, 'The purchase could not be deleted.'), 'error');
+      }
     }
   });
 }
@@ -4174,11 +4891,15 @@ function openRecordReceipt(saleId) {
         <div class="field" data-field="amount">
           <label for="rcptAmount">Amount Received <span class="req">*</span></label>
           <div class="input-affix">
-            <span class="prefix">₹</span>
+            <span class="prefix">${currencySymbol()}</span>
             <input class="input" id="rcptAmount" name="amount" type="number" min="0" step="0.01"
                    max="${s.balance}" value="${s.balance}">
           </div>
           <span class="err">Enter an amount between 0 and ${formatCurrency(s.balance)}</span>
+        </div>
+        <div class="field">
+          <label for="rcptMode">Payment Mode</label>
+          <select class="select" id="rcptMode">${PAYMENT_MODES.map(m => `<option value="${m}">${m}</option>`).join('')}</select>
         </div>
       </form>`,
     footer: `
@@ -4187,18 +4908,22 @@ function openRecordReceipt(saleId) {
     onMount(el) {
       const form = el.querySelector('#rcptForm');
       const input = el.querySelector('#rcptAmount');
+      const mode = el.querySelector('#rcptMode');
       input.focus(); input.select();
 
-      form.addEventListener('submit', e => {
+      form.addEventListener('submit', async e => {
         e.preventDefault();
         const amt = round2(Number(input.value) || 0);
         const wrap = form.querySelector('[data-field="amount"]');
         wrap.classList.remove('invalid');
         if (amt <= 0 || amt > s.balance) { wrap.classList.add('invalid'); return; }
 
-        s.paid = round2(s.paid + amt);
-        s.balance = round2(s.total - s.paid);
-        saveData(['sales']);
+        const btn = document.querySelector('.modal-foot [form="rcptForm"]');
+        const res = await withBusyButton(btn, 'Recording…',
+          () => recordSettlement('sale', saleId, amt, mode.value, todayISO()));
+
+        if (!res.ok) { showToast(res.message, 'error'); return; }
+
         closeModal();
         showToast('Receipt recorded successfully');
         render();
@@ -4217,14 +4942,43 @@ function confirmDeleteSale(id) {
       + `<br><br>The stock sold on this invoice will be returned to inventory.`
       + `<br><br>This cannot be undone.`,
     confirmLabel: 'Delete',
+    busyLabel: 'Deleting…',
     danger: true,
-    onConfirm() {
-      state.ledger = state.ledger.filter(l => !(l.reference === s.invoiceNumber && l.type === 'Sale'));
-      state.sales = state.sales.filter(x => x.id !== id);
-      recalculateAllBalances();
-      saveData();
-      renderSales();
-      showToast('Invoice deleted successfully');
+    async onConfirm() {
+      const ops = [];
+
+      // Put the sold stock back, then remove every trace of the invoice.
+      (s.items || []).forEach(line => {
+        const item = findItem(line.itemId);
+        if (!item) return;
+        ops.push({
+          action: 'update', sheet: 'Items', id: item.id,
+          data: Object.assign({}, item, { currentStock: round2(item.currentStock + line.quantity) })
+        });
+      });
+
+      state.ledger
+        .filter(l => l.type === 'Sale' && l.reference === s.invoiceNumber)
+        .forEach(l => ops.push({ action: 'delete', sheet: 'Stock_Ledger', id: l.id }));
+
+      (s.items || []).forEach(line =>
+        ops.push({ action: 'delete', sheet: 'Sales_Items', id: line.id }));
+
+      state.payments
+        .filter(pay => pay.referenceType === 'Sale' && pay.referenceId === s.id)
+        .forEach(pay => ops.push({ action: 'delete', sheet: 'Payments', id: pay.id }));
+
+      ops.push({ action: 'delete', sheet: 'Sales', id: s.id });
+
+      try {
+        await repoTransaction(ops);
+        await syncAll();
+        renderSales();
+        showToast('Invoice deleted and stock returned');
+      } catch (err) {
+        console.error('[HisabKit] invoice delete failed', err);
+        showToast(describeApiError(err, 'The invoice could not be deleted.'), 'error');
+      }
     }
   });
 }
@@ -4426,17 +5180,30 @@ function openPartyForm(kind, id) {
           return;
         }
 
-        if (isEdit) {
-          Object.assign(existing, data);
-          showToast(`${cfg.label} updated successfully`);
-        } else {
-          state[cfg.list].push(Object.assign({ id: generateId(kind === 'supplier' ? 'sup' : 'cus') }, data));
-          showToast(`${cfg.label} added successfully`);
-        }
+        const sheetName = kind === 'supplier' ? 'Suppliers' : 'Customers';
+        const button = el.querySelector('.modal-foot button[type="submit"]');
 
-        saveData([cfg.list]);
-        closeModal();
-        render();
+        withBusyButton(button, isEdit ? 'Updating…' : 'Saving…', async () => {
+          try {
+            if (isEdit) {
+              await repoUpdate(sheetName, id, Object.assign({}, existing, data));
+              showToast(`${cfg.label} updated successfully`);
+            } else {
+              await repoCreate(sheetName, Object.assign({
+                id: nextId(sheetName),
+                balanceType: 'Debit',
+                creditLimit: 0,
+                status: 'Active'
+              }, data));
+              showToast(`${cfg.label} added successfully`);
+            }
+            closeModal();
+            render();
+          } catch (err) {
+            console.error('[HisabKit] saving ' + kind + ' failed', err);
+            showToast(describeApiError(err, `The ${cfg.label.toLowerCase()} could not be saved.`), 'error');
+          }
+        });
       });
     }
   });
@@ -4501,19 +5268,30 @@ function confirmDeleteParty(kind, id) {
   const isSupplier = kind === 'supplier';
   const linked = (isSupplier ? state.purchases : state.sales)
     .filter(t => (isSupplier ? t.supplierId : t.customerId) === id).length;
+  const payments = state.payments.filter(p => p.partyId === id).length;
+  const sheetName = isSupplier ? 'Suppliers' : 'Customers';
+
+  const blockers = [];
+  if (linked) blockers.push(linked + ' ' + (isSupplier ? 'purchase' : 'sale') + (linked === 1 ? '' : 's'));
+  if (payments) blockers.push(payments + ' payment' + (payments === 1 ? '' : 's'));
 
   confirmDialog({
     title: `Delete ${cfg.label.toLowerCase()}`,
-    message: `Delete <strong>${escapeHtml(party.name)}</strong>?`
-      + (linked ? `<br><br>This party is linked to <strong>${linked}</strong> transaction${linked > 1 ? 's' : ''}. Those records are kept, but will show no party name.` : '')
-      + `<br><br>This cannot be undone.`,
-    confirmLabel: 'Delete',
-    danger: true,
-    onConfirm() {
-      state[cfg.list] = state[cfg.list].filter(p => p.id !== id);
-      saveData([cfg.list]);
-      render();
-      showToast(`${cfg.label} deleted successfully`);
+    message: blockers.length
+      ? `<strong>${escapeHtml(party.name)}</strong> cannot be deleted.<br><br>It is used by ${blockers.join(' and ')}. Set the status to Inactive instead.`
+      : `Delete <strong>${escapeHtml(party.name)}</strong>?<br><br>This cannot be undone.`,
+    confirmLabel: blockers.length ? 'Close' : 'Delete',
+    danger: !blockers.length,
+    async onConfirm() {
+      if (blockers.length) return;
+      try {
+        await repoDelete(sheetName, id);
+        render();
+        showToast(`${cfg.label} deleted successfully`);
+      } catch (err) {
+        console.error('[HisabKit] delete ' + kind + ' failed', err);
+        showToast(describeApiError(err, `The ${cfg.label.toLowerCase()} could not be deleted.`), 'error');
+      }
     }
   });
 }
@@ -4522,63 +5300,99 @@ function confirmDeleteParty(kind, id) {
    8j. RENDERING — CATEGORIES & LOW STOCK
    ============================================================ */
 
+/**
+ * Categories are real records in the Categories sheet, not just the distinct
+ * values found on items, so they can be added and renamed before any item
+ * uses them. The item counts beside each one are still derived from Items.
+ */
 function renderCategories() {
-  const map = {};
+  const statsByCategory = {};
   state.items.forEach(it => {
     const c = it.category || 'Uncategorised';
-    if (!map[c]) map[c] = { name:c, count:0, value:0, low:0, out:0 };
-    map[c].count++;
-    map[c].value += itemStockValue(it);
+    if (!statsByCategory[c]) statsByCategory[c] = { count:0, value:0, low:0, out:0 };
+    statsByCategory[c].count++;
+    statsByCategory[c].value += itemStockValue(it);
     const st = calculateStockStatus(it);
-    if (st === 'Low Stock') map[c].low++;
-    if (st === 'Out of Stock') map[c].out++;
+    if (st === 'Low Stock') statsByCategory[c].low++;
+    if (st === 'Out of Stock') statsByCategory[c].out++;
   });
-  const cats = Object.values(map).sort((a, b) => b.value - a.value);
+
+  // Anything used by an item but missing from the sheet is still shown, so no
+  // stock is ever hidden from this page.
+  const known = new Set(state.categories.map(c => c.name));
+  const orphanNames = Object.keys(statsByCategory).filter(n => !known.has(n));
+
+  const rows = state.categories.map(c => Object.assign(
+    { record: c, name: c.name, status: c.status || 'Active', description: c.description || '' },
+    statsByCategory[c.name] || { count:0, value:0, low:0, out:0 }
+  )).concat(orphanNames.map(n => Object.assign(
+    { record: null, name: n, status: 'Not in sheet', description: '' },
+    statsByCategory[n]
+  )));
+
+  rows.sort((a, b) => b.value - a.value);
 
   document.getElementById('view').innerHTML = `
     <div class="view-inner">
       <div class="page-head">
         <div>
           <h2>Categories</h2>
-          <p>Stock grouped by category.</p>
+          <p>Groupings for your items, stored in the Categories sheet.</p>
         </div>
         <div class="page-head-actions">
           <button class="btn btn-default" id="catExport">${icon('download', 15)} Export</button>
-          <button class="btn btn-primary" id="catAdd">${icon('plus', 15)} Add Item</button>
+          <button class="btn btn-primary" id="catNew">${icon('plus', 15)} Add Category</button>
         </div>
+      </div>
+
+      <div class="stat-grid">
+        ${statCard({ tone:'blue',  icon:'filter', label:'Categories',    value:formatNumber(state.categories.length), sub:'In the sheet' })}
+        ${statCard({ tone:'green', icon:'check',  label:'Active',        value:formatNumber(state.categories.filter(c => (c.status||'Active').toLowerCase() !== 'inactive').length), sub:'Selectable on items' })}
+        ${statCard({ tone:'amber', icon:'inventory', label:'Categorised Items', value:formatNumber(state.items.filter(i => i.category).length), sub:`of ${formatNumber(state.items.length)} items` })}
       </div>
 
       <div class="table-wrap">
         <div class="table-scroll">
           <table class="data">
             <thead><tr>
-              <th>Category</th><th class="num">Items</th><th class="num">Stock Value</th>
+              <th>Category</th><th>Description</th><th>Status</th>
+              <th class="num">Items</th><th class="num">Stock Value</th>
               <th class="num">Low Stock</th><th class="num">Out of Stock</th><th class="td-actions">Actions</th>
             </tr></thead>
             <tbody>
-              ${cats.length ? cats.map(c => `
+              ${rows.length ? rows.map(c => `
                 <tr>
                   <td class="td-strong">${escapeHtml(c.name)}</td>
+                  <td class="td-sub">${escapeHtml(c.description || '—')}</td>
+                  <td>${c.status.toLowerCase() === 'active'
+                        ? '<span class="badge badge-active">Active</span>'
+                        : `<span class="badge">${escapeHtml(c.status)}</span>`}</td>
                   <td class="num">${formatNumber(c.count)}</td>
                   <td class="num td-strong">${formatCurrency(c.value)}</td>
                   <td class="num">${c.low ? `<span class="badge badge-lowstock">${c.low}</span>` : '—'}</td>
                   <td class="num">${c.out ? `<span class="badge badge-outstock">${c.out}</span>` : '—'}</td>
                   <td class="td-actions">
-                    <button class="btn btn-default btn-sm" data-catview="${escapeHtml(c.name)}">View Items</button>
+                    <div style="display:flex;gap:6px;justify-content:flex-end;">
+                      <button class="btn btn-default btn-sm" data-catview="${escapeHtml(c.name)}">View Items</button>
+                      ${c.record ? `<button class="icon-btn" data-catmenu="${escapeHtml(c.record.id)}" aria-label="Category actions">${icon('more', 16)}</button>` : ''}
+                    </div>
                   </td>
-                </tr>`).join('') : emptyRow(6, 'No categories', 'Categories appear once you add items.')}
+                </tr>`).join('') : emptyRow(8, 'No categories yet', 'Add your first category to group your items.')}
             </tbody>
           </table>
+        </div>
+        <div class="table-foot">
+          <span class="foot-info"><strong>${rows.length}</strong> categor${rows.length === 1 ? 'y' : 'ies'}</span>
         </div>
       </div>
     </div>`;
 
   const view = document.getElementById('view');
-  view.querySelector('#catAdd').addEventListener('click', () => openItemForm(null));
+  view.querySelector('#catNew').addEventListener('click', () => openCategoryForm(null));
   view.querySelector('#catExport').addEventListener('click', () => {
     exportCSV('hisabkit-categories.csv',
-      ['Category','Items','Stock Value','Low Stock','Out of Stock'],
-      cats.map(c => [c.name, c.count, c.value, c.low, c.out]));
+      ['Category','Description','Status','Items','Stock Value','Low Stock','Out of Stock'],
+      rows.map(c => [c.name, c.description, c.status, c.count, c.value, c.low, c.out]));
   });
   view.querySelectorAll('[data-catview]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -4586,6 +5400,129 @@ function renderCategories() {
       state.inventory.page = 1;
       navigate('inventory');
     });
+  });
+  view.querySelectorAll('[data-catmenu]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const id = btn.dataset.catmenu;
+      openContextMenu(btn, [
+        { label:'Edit Category', icon:'edit', onClick:() => openCategoryForm(id) },
+        '---',
+        { label:'Delete Category', icon:'trash', danger:true, onClick:() => confirmDeleteCategory(id) }
+      ]);
+    });
+  });
+}
+
+/** Add (id = null) or edit a category. */
+function openCategoryForm(id) {
+  const existing = id ? state.categories.find(c => c.id === id) : null;
+  const isEdit = !!existing;
+  const d = existing || { name:'', description:'', status:'Active' };
+
+  openModal({
+    title: isEdit ? 'Edit Category' : 'Add Category',
+    body: `
+      <form id="categoryForm" novalidate>
+        <div class="form-grid">
+          <div class="field span-2" data-field="name">
+            <label for="cName">Category Name <span class="req">*</span></label>
+            <input class="input" id="cName" name="name" value="${escapeHtml(d.name)}"
+                   placeholder="e.g. Copper Pipes" autocomplete="off">
+            <span class="err">Category name is required</span>
+          </div>
+          <div class="field span-2">
+            <label for="cDesc">Description</label>
+            <textarea class="textarea" id="cDesc" name="description"
+                      placeholder="Optional">${escapeHtml(d.description)}</textarea>
+          </div>
+          <div class="field span-2">
+            <label for="cStatus">Status</label>
+            <select class="select" id="cStatus" name="status">
+              <option value="Active" ${(d.status || 'Active') === 'Active' ? 'selected' : ''}>Active</option>
+              <option value="Inactive" ${d.status === 'Inactive' ? 'selected' : ''}>Inactive</option>
+            </select>
+            <span class="hint">Inactive categories stay on existing items but are not offered on new ones.</span>
+          </div>
+        </div>
+      </form>`,
+    footer: `
+      <button class="btn btn-default" type="button" data-modal-close>Cancel</button>
+      <button class="btn btn-primary" type="submit" form="categoryForm">
+        ${icon('check', 15)} ${isEdit ? 'Update Category' : 'Save Category'}
+      </button>`,
+    onMount(el) {
+      const form = el.querySelector('#categoryForm');
+      el.querySelector('#cName').focus();
+
+      form.addEventListener('submit', e => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        const data = {
+          name: (fd.get('name') || '').trim(),
+          description: (fd.get('description') || '').trim(),
+          status: fd.get('status') || 'Active'
+        };
+
+        form.querySelectorAll('.field').forEach(f => f.classList.remove('invalid'));
+        if (!data.name) {
+          form.querySelector('[data-field="name"]').classList.add('invalid');
+          showToast('Please fill all required fields', 'error');
+          return;
+        }
+        if (state.categories.some(c => c.name.toLowerCase() === data.name.toLowerCase() && c.id !== id)) {
+          form.querySelector('[data-field="name"]').classList.add('invalid');
+          showToast('That category already exists', 'error');
+          return;
+        }
+
+        const button = el.querySelector('.modal-foot button[type="submit"]');
+        withBusyButton(button, isEdit ? 'Updating…' : 'Saving…', async () => {
+          try {
+            if (isEdit) {
+              await repoUpdate('Categories', id, data);
+              showToast('Category updated successfully');
+            } else {
+              await repoCreate('Categories', Object.assign({ id: nextId('Categories') }, data));
+              showToast('Category added successfully');
+            }
+            closeModal();
+            render();
+          } catch (err) {
+            console.error('[HisabKit] saving category failed', err);
+            showToast(describeApiError(err, 'The category could not be saved.'), 'error');
+          }
+        });
+      });
+    }
+  });
+}
+
+/** A category in use by items cannot be deleted — it is offered Inactive instead. */
+function confirmDeleteCategory(id) {
+  const category = state.categories.find(c => c.id === id);
+  if (!category) return;
+
+  const used = state.items.filter(i => (i.category || '') === category.name).length;
+
+  confirmDialog({
+    title: 'Delete category',
+    message: used
+      ? `<strong>${escapeHtml(category.name)}</strong> is used by <strong>${used}</strong> item${used === 1 ? '' : 's'} and cannot be deleted. Set its status to Inactive instead.`
+      : `Delete <strong>${escapeHtml(category.name)}</strong>?<br><br>This cannot be undone.`,
+    confirmLabel: used ? 'Close' : 'Delete',
+    danger: !used,
+    async onConfirm() {
+      if (used) return;
+      try {
+        await repoDelete('Categories', id);
+        render();
+        showToast('Category deleted successfully');
+      } catch (err) {
+        console.error('[HisabKit] delete category failed', err);
+        showToast(describeApiError(err, 'The category could not be deleted.'), 'error');
+      }
+    }
   });
 }
 
@@ -4718,6 +5655,13 @@ function renderDashboard() {
         ${statCard({ tone:'red',   icon:'arrowUp', label:'Payables',          value:formatCurrency(s.payables),       sub:'You owe suppliers' })}
       </div>
 
+      <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(190px,1fr));">
+        ${statCard({ tone:'blue',  icon:'cart',    label:'Total Sales',     value:formatCurrency(s.totalSales),     sub:`${state.sales.length} invoice${state.sales.length === 1 ? '' : 's'}` })}
+        ${statCard({ tone:'navy',  icon:'receipt', label:'Total Purchases', value:formatCurrency(s.totalPurchases), sub:`${state.purchases.length} bill${state.purchases.length === 1 ? '' : 's'}` })}
+        ${statCard({ tone:'green', icon:'users',   label:'Customers',       value:formatNumber(s.customerCount),    sub:'Parties you sell to' })}
+        ${statCard({ tone:'amber', icon:'truck',   label:'Suppliers',       value:formatNumber(s.supplierCount),    sub:'Parties you buy from' })}
+      </div>
+
       <div class="chart-grid">
         <div class="card">
           <div class="card-head">
@@ -4733,7 +5677,7 @@ function renderDashboard() {
             <div class="bar-chart">
               ${days.map(d => `
                 <div class="bar-col" title="${d.label}: ${formatCurrency(d.value)}">
-                  <span class="bar-val">${d.value ? formatCurrency(d.value).replace('₹','') : ''}</span>
+                  <span class="bar-val">${d.value ? formatCurrency(d.value).slice(currencySymbol().length) : ''}</span>
                   <div class="bar" style="height:${Math.max(3, (d.value / maxDay) * 100)}%;opacity:${d.value ? 1 : 0.18};"></div>
                   <span class="bar-lbl">${d.label}</span>
                 </div>`).join('')}
@@ -5093,49 +6037,537 @@ function renderCashBank() {
     </div>`;
 }
 
+/* ============================================================
+   8m. RENDERING — PAYMENTS
+   ============================================================ */
+
+function getFilteredPayments() {
+  const f = state.paymentFilter;
+  return state.payments.filter(p => {
+    if (f.partyType && p.partyType !== f.partyType) return false;
+    if (f.transactionType && p.transactionType !== f.transactionType) return false;
+    if (f.from && p.date < f.from) return false;
+    if (f.to && p.date > f.to) return false;
+    return true;
+  }).slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+}
+
+function paymentPartyName(p) {
+  return p.partyType === 'Supplier' ? supplierName(p.partyId) : customerName(p.partyId);
+}
+
+function paymentReference(p) {
+  if (!p.referenceId) return p.notes || '—';
+  const doc = p.referenceType === 'Purchase'
+    ? state.purchases.find(x => x.id === p.referenceId)
+    : state.sales.find(x => x.id === p.referenceId);
+  if (!doc) return p.referenceId;
+  return (p.referenceType === 'Purchase' ? doc.billNumber : doc.invoiceNumber) || p.referenceId;
+}
+
+function renderPayments() {
+  const f = state.paymentFilter;
+  const rows = getFilteredPayments();
+
+  const received = round2(sum(rows.filter(p => p.transactionType === 'Received'), p => p.amount));
+  const paid     = round2(sum(rows.filter(p => p.transactionType === 'Paid'), p => p.amount));
+
+  document.getElementById('view').innerHTML = `
+    <div class="view-inner">
+      <div class="page-head">
+        <div>
+          <h2>Payments</h2>
+          <p>Money received from customers and paid to suppliers.</p>
+        </div>
+        <div class="page-head-actions">
+          <button class="btn btn-default" id="payExport">${icon('download', 15)} Export</button>
+          <button class="btn btn-primary" id="payNew">${icon('plus', 15)} Record Payment</button>
+        </div>
+      </div>
+
+      <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr));">
+        ${statCard({ tone:'green', icon:'arrowDown', label:'Received', value:formatCurrency(received, true), sub:'From customers' })}
+        ${statCard({ tone:'red',   icon:'arrowUp',   label:'Paid',     value:formatCurrency(paid, true),     sub:'To suppliers' })}
+        ${statCard({ tone:'blue',  icon:'wallet',    label:'Net',      value:formatCurrency(round2(received - paid), true), sub:'Received − Paid' })}
+      </div>
+
+      <div class="filter-bar no-print">
+        <div class="filter-group">
+          <label for="payPartyType">Party Type</label>
+          <select class="select w-140" id="payPartyType">
+            <option value="">All</option>
+            ${['Customer','Supplier'].map(t => `<option value="${t}" ${f.partyType === t ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+        </div>
+        <div class="filter-group">
+          <label for="payTxnType">Transaction</label>
+          <select class="select w-140" id="payTxnType">
+            <option value="">All</option>
+            ${['Received','Paid'].map(t => `<option value="${t}" ${f.transactionType === t ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+        </div>
+        <div class="filter-group">
+          <label for="payFrom">Date From</label>
+          <input class="input w-140" id="payFrom" type="date" value="${f.from}">
+        </div>
+        <div class="filter-group">
+          <label for="payTo">Date To</label>
+          <input class="input w-140" id="payTo" type="date" value="${f.to}">
+        </div>
+        <div class="filter-actions">
+          <button class="btn btn-ghost btn-sm" id="payReset">${icon('reset', 14)} Reset</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <table class="data">
+            <thead><tr>
+              <th>Date</th><th>Payment ID</th><th>Party</th><th>Party Type</th>
+              <th>Against</th><th>Mode</th><th class="num">Amount</th><th>Notes</th>
+              <th class="td-actions">Actions</th>
+            </tr></thead>
+            <tbody>
+              ${rows.length ? rows.map(p => `
+                <tr data-id="${p.id}">
+                  <td>${formatDate(p.date)}</td>
+                  <td class="mono td-sub">${escapeHtml(p.id)}</td>
+                  <td class="td-strong">${escapeHtml(paymentPartyName(p))}</td>
+                  <td><span class="badge badge-neutral">${escapeHtml(p.partyType)}</span></td>
+                  <td class="mono td-sub">${escapeHtml(paymentReference(p))}</td>
+                  <td>${escapeHtml(p.paymentMode)}</td>
+                  <td class="num td-strong" style="color:${p.transactionType === 'Received' ? 'var(--success)' : 'var(--danger)'};">
+                    ${p.transactionType === 'Received' ? '+' : '−'}${formatCurrency(p.amount, true)}
+                  </td>
+                  <td class="td-sub">${escapeHtml(p.notes || '—')}</td>
+                  <td class="td-actions">
+                    <button class="row-menu-btn" data-paymenu="${p.id}" aria-label="Actions for ${escapeHtml(p.id)}" aria-haspopup="menu">
+                      ${icon('more', 16)}
+                    </button>
+                  </td>
+                </tr>`).join('') : emptyRow(9, 'No payments recorded', 'Record a payment, or settle a bill from Purchase Bills or Sales Invoices.')}
+            </tbody>
+          </table>
+        </div>
+        <div class="table-foot">
+          <span class="foot-info">
+            <strong>${rows.length}</strong> payment${rows.length === 1 ? '' : 's'} ·
+            Received <strong style="color:var(--success);">${formatCurrency(received)}</strong> ·
+            Paid <strong style="color:var(--danger);">${formatCurrency(paid)}</strong>
+          </span>
+        </div>
+      </div>
+    </div>`;
+
+  const view = document.getElementById('view');
+  view.querySelector('#payPartyType').addEventListener('change', e => {
+    state.paymentFilter.partyType = e.target.value; renderPayments();
+  });
+  view.querySelector('#payTxnType').addEventListener('change', e => {
+    state.paymentFilter.transactionType = e.target.value; renderPayments();
+  });
+  view.querySelector('#payFrom').addEventListener('change', e => {
+    state.paymentFilter.from = e.target.value; renderPayments();
+  });
+  view.querySelector('#payTo').addEventListener('change', e => {
+    state.paymentFilter.to = e.target.value; renderPayments();
+  });
+  view.querySelector('#payReset').addEventListener('click', () => {
+    state.paymentFilter = { partyType:'', transactionType:'', from:'', to:'' };
+    renderPayments();
+    showToast('Filters reset', 'info');
+  });
+  view.querySelector('#payNew').addEventListener('click', () => openPaymentForm());
+  view.querySelector('#payExport').addEventListener('click', () => {
+    exportCSV('hisabkit-payments.csv',
+      ['Date','Payment ID','Party','Party Type','Against','Mode','Transaction','Amount','Notes'],
+      rows.map(p => [
+        formatDate(p.date), p.id, paymentPartyName(p), p.partyType, paymentReference(p),
+        p.paymentMode, p.transactionType, p.amount, p.notes
+      ]));
+  });
+
+  view.querySelectorAll('[data-paymenu]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const id = btn.dataset.paymenu;
+      openContextMenu(btn, [
+        { label:'Delete Payment', icon:'trash', danger:true, onClick:() => confirmDeletePayment(id) }
+      ]);
+    });
+  });
+}
+
+/**
+ * Record a payment by hand. The party list follows the Party Type chosen, and
+ * picking one of the party's unpaid bills fills in the balance due.
+ */
+function openPaymentForm() {
+  const body = `
+    <form id="pmtForm" novalidate>
+      <div class="form-grid">
+        <div class="field">
+          <label for="pmPartyType">Party Type <span class="req">*</span></label>
+          <select class="select" id="pmPartyType">
+            <option value="Customer">Customer (money in)</option>
+            <option value="Supplier">Supplier (money out)</option>
+          </select>
+        </div>
+        <div class="field" data-field="party">
+          <label for="pmParty">Party <span class="req">*</span></label>
+          <select class="select" id="pmParty"></select>
+          <span class="err">Please select a party</span>
+        </div>
+        <div class="field">
+          <label for="pmReference">Against Bill / Invoice</label>
+          <select class="select" id="pmReference"><option value="">Not against a document</option></select>
+        </div>
+        <div class="field">
+          <label for="pmDate">Payment Date <span class="req">*</span></label>
+          <input class="input" id="pmDate" type="date" value="${todayISO()}">
+        </div>
+        <div class="field" data-field="amount">
+          <label for="pmAmount">Amount <span class="req">*</span></label>
+          <div class="input-affix">
+            <span class="prefix">${currencySymbol()}</span>
+            <input class="input" id="pmAmount" type="number" min="0" step="0.01" value="0">
+          </div>
+          <span class="err">Enter an amount greater than zero</span>
+        </div>
+        <div class="field">
+          <label for="pmMode">Payment Mode</label>
+          <select class="select" id="pmMode">${PAYMENT_MODES.map(m => `<option value="${m}">${m}</option>`).join('')}</select>
+        </div>
+        <div class="field">
+          <label for="pmTxnType">Transaction Type</label>
+          <input class="input" id="pmTxnType" value="Received" readonly style="background:var(--background);">
+        </div>
+        <div class="field">
+          <label for="pmNotes">Notes</label>
+          <input class="input" id="pmNotes" autocomplete="off" placeholder="Reference, cheque number…">
+        </div>
+      </div>
+    </form>`;
+
+  openModal({
+    title: 'Record Payment',
+    size: 'lg',
+    body,
+    footer: `
+      <button class="btn btn-default" type="button" data-modal-close>Cancel</button>
+      <button class="btn btn-primary" type="submit" form="pmtForm">${icon('check', 15)} Save Payment</button>`,
+    onMount(el) {
+      const form      = el.querySelector('#pmtForm');
+      const typeSel   = el.querySelector('#pmPartyType');
+      const partySel  = el.querySelector('#pmParty');
+      const refSel    = el.querySelector('#pmReference');
+      const txnInput  = el.querySelector('#pmTxnType');
+      const amountIn  = el.querySelector('#pmAmount');
+
+      /** The party's unpaid documents, newest first. */
+      function openDocuments(partyType, partyId) {
+        const buying = partyType === 'Supplier';
+        const list = (buying ? state.purchases : state.sales)
+          .filter(d => (buying ? d.supplierId : d.customerId) === partyId && d.balance > 0)
+          .sort((a, b) => (a.date < b.date ? 1 : -1));
+        return list.map(d => ({
+          doc: d,
+          label: (buying ? d.billNumber : d.invoiceNumber) + ' · due ' + formatCurrency(d.balance)
+        }));
+      }
+
+      function refreshParties() {
+        const buying = typeSel.value === 'Supplier';
+        const list = buying ? state.suppliers : state.customers;
+
+        partySel.innerHTML = list.length
+          ? `<option value="">Select ${buying ? 'supplier' : 'customer'}…</option>` +
+            list.map(p => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('')
+          : `<option value="">No ${buying ? 'suppliers' : 'customers'} yet</option>`;
+
+        txnInput.value = buying ? 'Paid' : 'Received';
+        refreshReferences();
+      }
+
+      function refreshReferences() {
+        const docs = partySel.value ? openDocuments(typeSel.value, partySel.value) : [];
+        refSel.innerHTML = `<option value="">Not against a document</option>` +
+          docs.map(d => `<option value="${d.doc.id}">${escapeHtml(d.label)}</option>`).join('');
+        amountIn.value = 0;
+      }
+
+      typeSel.addEventListener('change', refreshParties);
+      partySel.addEventListener('change', refreshReferences);
+      refSel.addEventListener('change', () => {
+        const docs = openDocuments(typeSel.value, partySel.value);
+        const chosen = docs.find(d => d.doc.id === refSel.value);
+        amountIn.value = chosen ? chosen.doc.balance : 0;
+      });
+
+      refreshParties();
+      amountIn.focus();
+
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        form.querySelectorAll('.field').forEach(f => f.classList.remove('invalid'));
+
+        const amount = round2(Number(amountIn.value) || 0);
+        if (!partySel.value) {
+          form.querySelector('[data-field="party"]').classList.add('invalid');
+          showToast('Please select a party', 'error');
+          return;
+        }
+        if (amount <= 0) {
+          form.querySelector('[data-field="amount"]').classList.add('invalid');
+          showToast('Enter an amount greater than zero', 'error');
+          return;
+        }
+
+        const btn = document.querySelector('.modal-foot [form="pmtForm"]');
+        const res = await withBusyButton(btn, 'Saving payment…', () => savePayment({
+          partyType: typeSel.value,
+          partyId: partySel.value,
+          referenceId: refSel.value,
+          amount: amount,
+          date: el.querySelector('#pmDate').value || todayISO(),
+          paymentMode: el.querySelector('#pmMode').value,
+          notes: el.querySelector('#pmNotes').value.trim()
+        }));
+
+        if (!res.ok) { showToast(res.message, 'error'); return; }
+
+        closeModal();
+        showToast('Payment recorded successfully');
+        render();
+      });
+    }
+  });
+}
+
+/**
+ * Write a payment, and settle the bill it is recorded against. Both rows go in
+ * one batch, so the payments list and the bill always agree.
+ */
+async function savePayment(fields) {
+  const buying = fields.partyType === 'Supplier';
+  const ops = [{
+    action: 'create',
+    sheet: 'Payments',
+    id: nextId('Payments'),
+    data: {
+      date: fields.date || todayISO(),
+      partyType: fields.partyType,
+      partyId: fields.partyId,
+      referenceType: fields.referenceId ? (buying ? 'Purchase' : 'Sale') : '',
+      referenceId: fields.referenceId || '',
+      amount: round2(fields.amount),
+      paymentMode: fields.paymentMode || 'Cash',
+      transactionType: buying ? 'Paid' : 'Received',
+      notes: fields.notes || ''
+    }
+  }];
+
+  if (fields.referenceId) {
+    const list = buying ? state.purchases : state.sales;
+    const doc = list.find(d => d.id === fields.referenceId);
+    if (!doc) return { ok: false, message: 'That bill is no longer loaded. Reload the page and try again.' };
+    if (round2(fields.amount) > round2(doc.balance)) {
+      return { ok: false, message: 'The amount cannot be more than the balance due of ' + formatCurrency(doc.balance) + '.' };
+    }
+
+    const paid = round2(doc.paid + fields.amount);
+    const updated = Object.assign({}, doc, { paid: paid, balance: round2(doc.total - paid) });
+    updated.paymentStatus = purchaseStatus(updated);
+    ops.push({ action: 'update', sheet: buying ? 'Purchases' : 'Sales', id: doc.id, data: updated });
+  }
+
+  try {
+    await repoTransaction(ops);
+    await syncAll();
+    return { ok: true };
+  } catch (err) {
+    console.error('[HisabKit] payment save failed', err);
+    return { ok: false, message: describeApiError(err, 'Payment could not be saved.') };
+  }
+}
+
+function confirmDeletePayment(id) {
+  const p = state.payments.find(x => x.id === id);
+  if (!p) return;
+
+  confirmDialog({
+    title: 'Delete payment',
+    message: `Delete payment <strong>${escapeHtml(p.id)}</strong> of ${formatCurrency(p.amount)}?`
+      + `<br><br>If it was recorded against a bill, that bill's paid amount is reduced by the same figure.`,
+    confirmLabel: 'Delete',
+    busyLabel: 'Deleting…',
+    danger: true,
+    async onConfirm() {
+      const ops = [{ action: 'delete', sheet: 'Payments', id: p.id }];
+
+      // Take the money back off the bill it settled, so the two stay in step.
+      const doc = p.referenceType === 'Purchase'
+        ? state.purchases.find(x => x.id === p.referenceId)
+        : state.sales.find(x => x.id === p.referenceId);
+
+      if (doc) {
+        const paid = round2(Math.max(0, doc.paid - p.amount));
+        const updated = Object.assign({}, doc, { paid: paid, balance: round2(doc.total - paid) });
+        updated.paymentStatus = purchaseStatus(updated);
+        ops.push({
+          action: 'update',
+          sheet: p.referenceType === 'Purchase' ? 'Purchases' : 'Sales',
+          id: doc.id, data: updated
+        });
+      }
+
+      try {
+        await repoTransaction(ops);
+        await syncAll();
+        render();
+        showToast('Payment deleted successfully');
+      } catch (err) {
+        console.error('[HisabKit] payment delete failed', err);
+        showToast(describeApiError(err, 'The payment could not be deleted.'), 'error');
+      }
+    }
+  });
+}
+
+/** The sheet row holding a setting, or null when the sheet has none yet. */
+function settingRow(key) {
+  const wanted = String(key).toLowerCase();
+  return state.settingRows.find(r => String(r.SettingKey || '').trim().toLowerCase() === wanted) || null;
+}
+
+/**
+ * Write every setting to the Settings sheet as one batch: rows that already
+ * exist are updated in place, keys the sheet is missing are created. The sheet
+ * stays the source of truth, so the values survive a reload on any device.
+ */
+async function saveSettings(values) {
+  const ops = [];
+  let seq = highestSuffix('Settings');
+
+  SETTING_DEFS.forEach(def => {
+    const value = String(values[def.field] === undefined || values[def.field] === null ? '' : values[def.field]);
+    const row = settingRow(def.key);
+    const data = {
+      SettingKey: def.key,
+      SettingValue: value,
+      Description: def.label,
+      Status: 'Active'
+    };
+
+    if (row && row.SettingID) {
+      ops.push({ action: 'update', sheet: 'Settings', id: String(row.SettingID).trim(), data: data });
+    } else {
+      seq += 1;
+      ops.push({
+        action: 'create', sheet: 'Settings',
+        id: SHEETS.Settings.prefix + String(seq).padStart(3, '0'),
+        data: data
+      });
+    }
+  });
+
+  try {
+    await repoTransaction(ops);
+    await syncAll();
+    state.settings = Object.assign({}, state.settings, values);
+    state.settings.lowStockAlert = cellBool(state.settings.lowStockAlert);
+    state.settings.taxEnabled = cellBool(state.settings.taxEnabled);
+    return { ok: true };
+  } catch (err) {
+    console.error('[HisabKit] settings save failed', err);
+    return { ok: false, message: describeApiError(err, 'Settings could not be saved.') };
+  }
+}
+
+/** One input for a setting, shaped by what the setting holds. */
+function settingField(def, value) {
+  const id = 'set_' + def.field;
+
+  if (def.field === 'address') {
+    return `<div class="field">
+      <label for="${id}">${escapeHtml(def.label)}</label>
+      <textarea class="textarea" id="${id}" name="${def.field}">${escapeHtml(value)}</textarea>
+      ${def.hint ? `<span class="hint">${escapeHtml(def.hint)}</span>` : ''}
+    </div>`;
+  }
+
+  if (def.field === 'taxEnabled' || def.field === 'lowStockAlert') {
+    const on = cellBool(value);
+    return `<div class="field">
+      <label for="${id}">${escapeHtml(def.label)}</label>
+      <select class="select" id="${id}" name="${def.field}">
+        <option value="Yes" ${on ? 'selected' : ''}>Yes</option>
+        <option value="No" ${!on ? 'selected' : ''}>No</option>
+      </select>
+      ${def.hint ? `<span class="hint">${escapeHtml(def.hint)}</span>` : ''}
+    </div>`;
+  }
+
+  const type = def.field === 'defaultTaxRate' ? 'number' : 'text';
+  const extra = def.field === 'currencySymbol' ? ' maxlength="3"' : '';
+  return `<div class="field">
+    <label for="${id}">${escapeHtml(def.label)}</label>
+    <input class="input" id="${id}" name="${def.field}" type="${type}"${extra} value="${escapeHtml(value)}">
+    ${def.hint ? `<span class="hint">${escapeHtml(def.hint)}</span>` : ''}
+  </div>`;
+}
+
 function renderSettings() {
   const s = state.settings;
+  const profileFields = ['businessName','userName','gstin','phone','address'];
+  const prefFields = ['currency','currencySymbol','taxEnabled','defaultTaxRate',
+                      'invoicePrefix','purchasePrefix','lowStockAlert'];
+
+  const fieldsFor = names => SETTING_DEFS
+    .filter(def => names.indexOf(def.field) !== -1)
+    .map(def => settingField(def, s[def.field]))
+    .join('');
+
   document.getElementById('view').innerHTML = `
     <div class="view-inner">
       <div class="page-head">
         <div>
           <h2>Settings</h2>
-          <p>Business profile and data management.</p>
+          <p>Business profile and data management. Everything here is stored in the Settings sheet.</p>
+        </div>
+        <div class="page-head-actions">
+          <button class="btn btn-default" id="setReloadTop">${icon('reset', 15)} Reload from Google Sheets</button>
         </div>
       </div>
 
       <div class="grid-2" style="align-items:start;">
-        <div class="card">
-          <div class="card-head"><h3>Business Profile</h3></div>
-          <div class="card-pad">
-            <form id="settingsForm">
-              <div class="form-grid" style="grid-template-columns:1fr;">
-                <div class="field">
-                  <label for="setBiz">Business Name</label>
-                  <input class="input" id="setBiz" name="businessName" value="${escapeHtml(s.businessName)}">
+        <div class="stack">
+          <div class="card">
+            <div class="card-head"><h3>Business Profile</h3></div>
+            <div class="card-pad">
+              <form id="settingsForm">
+                <div class="form-grid" style="grid-template-columns:1fr;">
+                  ${fieldsFor(profileFields)}
                 </div>
-                <div class="field">
-                  <label for="setUser">User Name</label>
-                  <input class="input" id="setUser" name="userName" value="${escapeHtml(s.userName)}">
+                <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap;">
+                  <button class="btn btn-primary" type="submit">${icon('check', 15)} Save Settings</button>
                 </div>
-                <div class="field">
-                  <label for="setGstin">Business GSTIN</label>
-                  <input class="input" id="setGstin" name="gstin" value="${escapeHtml(s.gstin)}"
-                         placeholder="e.g. 07AABCS1429P1Z5">
+              </form>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Preferences</h3></div>
+            <div class="card-pad">
+              <form id="prefsForm">
+                <div class="form-grid">
+                  ${fieldsFor(prefFields)}
                 </div>
-                <div class="field">
-                  <label for="setPhone">Phone</label>
-                  <input class="input" id="setPhone" name="phone" value="${escapeHtml(s.phone)}">
+                <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap;">
+                  <button class="btn btn-primary" type="submit">${icon('check', 15)} Save Preferences</button>
                 </div>
-                <div class="field">
-                  <label for="setAddress">Address</label>
-                  <textarea class="textarea" id="setAddress" name="address">${escapeHtml(s.address)}</textarea>
-                </div>
-              </div>
-              <div style="margin-top:18px;">
-                <button class="btn btn-primary" type="submit">${icon('check', 15)} Save Settings</button>
-              </div>
-            </form>
+              </form>
+            </div>
           </div>
         </div>
 
@@ -5144,24 +6576,42 @@ function renderSettings() {
             <div class="card-head"><h3>Data</h3></div>
             <div class="card-pad">
               <div class="kv-row"><span class="k">Items</span><span class="v">${formatNumber(state.items.length)}</span></div>
+              <div class="kv-row"><span class="k">Categories</span><span class="v">${formatNumber(state.categories.length)}</span></div>
               <div class="kv-row"><span class="k">Suppliers</span><span class="v">${formatNumber(state.suppliers.length)}</span></div>
               <div class="kv-row"><span class="k">Customers</span><span class="v">${formatNumber(state.customers.length)}</span></div>
               <div class="kv-row"><span class="k">Purchase bills</span><span class="v">${formatNumber(state.purchases.length)}</span></div>
               <div class="kv-row"><span class="k">Sales invoices</span><span class="v">${formatNumber(state.sales.length)}</span></div>
               <div class="kv-row"><span class="k">Stock ledger entries</span><span class="v">${formatNumber(state.ledger.length)}</span></div>
+              <div class="kv-row"><span class="k">Payments</span><span class="v">${formatNumber(state.payments.length)}</span></div>
               <div class="kv-row"><span class="k">Storage used</span><span class="v">${formatNumber(storageUsedKB(), 1)} KB</span></div>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-head"><h3>Danger Zone</h3></div>
+            <div class="card-head"><h3>Google Sheets</h3></div>
+            <div class="card-pad">
+              <div class="kv-row"><span class="k">Status</span>
+                <span class="v" style="color:${state.apiOnline ? 'var(--success)' : 'var(--danger)'};">
+                  ${state.apiOnline ? 'Connected' : 'Not reachable'}
+                </span>
+              </div>
+              <div class="kv-row"><span class="k">Last synced</span>
+                <span class="v">${state.lastSync ? formatDate(state.lastSync.slice(0, 10)) : '—'}</span>
+              </div>
+              ${state.apiError ? `<p style="font-size:12.5px;color:var(--danger);margin-top:10px;">${escapeHtml(state.apiError)}</p>` : ''}
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Local Cache</h3></div>
             <div class="card-pad">
               <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:14px;">
-                These actions affect all of your locally stored HisabKit data and cannot be undone.
+                Your data lives in the Google Sheet. This browser keeps a copy so the app
+                still opens when the sheet cannot be reached; clearing it only removes that copy.
               </p>
               <div style="display:flex;gap:10px;flex-wrap:wrap;">
-                <button class="btn btn-default" id="setReseed">${icon('reset', 15)} Reset to Demo Data</button>
-                <button class="btn btn-danger" id="setWipe">${icon('trash', 15)} Erase All Data</button>
+                <button class="btn btn-default" id="setReload">${icon('reset', 15)} Reload from Google Sheets</button>
+                <button class="btn btn-danger" id="setClearCache">${icon('trash', 15)} Clear Local Cache</button>
               </div>
             </div>
           </div>
@@ -5170,57 +6620,70 @@ function renderSettings() {
     </div>`;
 
   const view = document.getElementById('view');
-  view.querySelector('#settingsForm').addEventListener('submit', e => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    state.settings = Object.assign({}, state.settings, {
-      businessName: (fd.get('businessName') || '').trim() || 'My Business',
-      userName: (fd.get('userName') || '').trim() || 'Admin',
-      gstin: (fd.get('gstin') || '').trim().toUpperCase(),
-      phone: (fd.get('phone') || '').trim(),
-      address: (fd.get('address') || '').trim()
+
+  /** Read a settings form and write it to the Settings sheet. */
+  async function submitSettings(form, button) {
+    const fd = new FormData(form);
+    const values = {};
+
+    SETTING_DEFS.forEach(def => {
+      if (!form.querySelector('[name="' + def.field + '"]')) return;
+      let value = (fd.get(def.field) || '').toString().trim();
+      if (def.field === 'businessName' && !value) value = 'My Business';
+      if (def.field === 'userName' && !value) value = 'Admin';
+      if (def.field === 'gstin') value = value.toUpperCase();
+      if (def.field === 'currencySymbol' && !value) value = '₹';
+      values[def.field] = value;
     });
-    saveData(['settings']);
+
+    const res = await withBusyButton(button, 'Saving…', () => saveSettings(values));
+
+    if (!res.ok) { showToast(res.message, 'error'); return; }
+
     renderSidebar();
     renderTopbar();
+    render();
     showToast('Settings saved successfully');
+  }
+
+  view.querySelector('#settingsForm').addEventListener('submit', e => {
+    e.preventDefault();
+    submitSettings(e.target, e.target.querySelector('button[type=submit]'));
   });
 
-  view.querySelector('#setReseed').addEventListener('click', () => {
+  view.querySelector('#prefsForm').addEventListener('submit', e => {
+    e.preventDefault();
+    submitSettings(e.target, e.target.querySelector('button[type=submit]'));
+  });
+
+  async function reloadFromSheet(button) {
+    const loaded = await withBusyButton(button || null, 'Loading…', () => loadFromApi());
+    if (loaded) {
+      clearSyncBanner();
+      renderSidebar();
+      renderTopbar();
+      render();
+      showToast('Reloaded from Google Sheets');
+    } else {
+      showSyncBanner(state.apiError);
+      showToast(state.apiError, 'error');
+    }
+  }
+
+  view.querySelector('#setReload').addEventListener('click', e => reloadFromSheet(e.currentTarget));
+  view.querySelector('#setReloadTop').addEventListener('click', e => reloadFromSheet(e.currentTarget));
+
+  view.querySelector('#setClearCache').addEventListener('click', () => {
     confirmDialog({
-      title: 'Reset to demo data',
-      message: 'This replaces <strong>all</strong> current data with the original demo dataset. Anything you have entered will be lost.',
-      confirmLabel: 'Reset to Demo Data',
+      title: 'Clear local cache',
+      message: 'This removes the copy of your data held in this browser. Your Google Sheet is not touched — the app will read everything back from it.',
+      confirmLabel: 'Clear Cache',
       danger: true,
       onConfirm() {
         Object.keys(STORAGE_KEYS).forEach(k => localStorage.removeItem(STORAGE_KEYS[k]));
-        Object.assign(state, { items:[], suppliers:[], customers:[], purchases:[], sales:[], ledger:[],
-          settings: Object.assign({}, DEFAULT_SETTINGS) });
-        seedDemoData();
-        loadData();
-        state.route = 'inventory';
-        renderSidebar();
-        render();
-        showToast('Demo data restored');
-      }
-    });
-  });
-
-  view.querySelector('#setWipe').addEventListener('click', () => {
-    confirmDialog({
-      title: 'Erase all data',
-      message: 'This permanently deletes <strong>everything</strong> — items, parties, purchases, sales and the stock ledger. You will start with an empty business.',
-      confirmLabel: 'Erase Everything',
-      danger: true,
-      onConfirm() {
-        Object.keys(STORAGE_KEYS).forEach(k => localStorage.removeItem(STORAGE_KEYS[k]));
-        Object.assign(state, { items:[], suppliers:[], customers:[], purchases:[], sales:[], ledger:[],
-          settings: Object.assign({}, DEFAULT_SETTINGS) });
-        saveData();
-        state.route = 'inventory';
-        renderSidebar();
-        render();
-        showToast('All data erased');
+        localStorage.removeItem(PENDING_KEY);
+        init();
+        showToast('Local cache cleared');
       }
     });
   });
@@ -5298,6 +6761,7 @@ function render() {
     case 'customers':        renderParties('customer'); break;
     case 'suppliers':        renderParties('supplier'); break;
     case 'reports':          renderReports(); break;
+    case 'payments':         renderPayments(); break;
     case 'cash-bank':        renderCashBank(); break;
     case 'settings':         renderSettings(); break;
     default:                 renderPlaceholder(r);
@@ -5384,32 +6848,30 @@ async function init() {
   // Honour the collapsed-sidebar preference on small screens
   if (window.innerWidth <= 900) state.sidebarCollapsed = true;
 
-  // Paint immediately from localStorage so the app is never blank, then
-  // reconcile with the Google Sheet.
+  // Paint immediately from the local cache so the app is never blank, then
+  // read the Google Sheet, which is the source of truth.
   renderSidebar();
   renderTopbar();
   document.getElementById('main').classList.toggle('collapsed', state.sidebarCollapsed);
   render();
   bindGlobalEvents();
 
-  const fromApi = await loadItemsFromApi();
+  const loaded = await loadFromApi();
 
-  if (fromApi) {
-    recalculateAllBalances();
+  if (loaded) {
+    clearSyncBanner();
     renderSidebar();
+    renderTopbar();
     render();
     return;
   }
 
-  // Sheet unreachable: fall back to localStorage, seeding the demo dataset
-  // only on a genuine first visit. Demo data is never mixed with real rows.
-  if (!state.items.length && !localStorage.getItem(STORAGE_KEYS.items)) {
-    seedDemoData();
-    loadData();
-    recalculateAllBalances();
-    renderSidebar();
-    render();
-  }
+  // The sheet could not be reached. Show the last data we read from it, and
+  // say so — nothing is invented to fill the gap.
+  showSyncBanner(state.apiError + ' — showing the last data saved on this device.');
+  renderTopbar();
+  render();
+  showToast(state.apiError, 'error');
 }
 
 // init() is async because it waits on the sheet; never let a rejection escape.
