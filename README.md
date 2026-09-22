@@ -94,11 +94,19 @@ worse than not saving it.
 ### Correctness note
 
 The sheet's `CurrentStock` is authoritative, and the ledger records what this app has
-done since. On every read the app works out what the ledger already accounts for and
-puts the difference in front of it as a local **Opening Stock** entry. Without that,
-an item that arrived with 50 in stock would be rewritten to the total of its later
-movements. The padding is never written to the sheet, and it is rebuilt on every
-load.
+done since. On every read the app compares the two and bridges the difference with a
+local ledger entry that is never written to the sheet:
+
+* the sheet shows **more** stock than the ledger accounts for — an **Opening Stock**
+  entry, dated before the item's first movement, because that stock was there before
+  the app recorded anything;
+* the sheet shows **less** — a **Correction** entry, dated last, because stock the
+  ledger counted is no longer in the spreadsheet: a stock take, or an edit made
+  directly in the sheet.
+
+Either way the figure on screen is the figure in the sheet, and the ledger adds up to
+it. The bridging entries are rebuilt on every load, so an edit made in the spreadsheet
+is never overwritten by what the app had worked out earlier.
 
 ---
 
@@ -152,6 +160,11 @@ IDs follow the sheet's own sequence: the highest number already used for that
 prefix, plus one. Prefixes are `ITM-`, `CAT-`, `CUS-`, `SUP-`, `PUR-`, `PI-`,
 `SAL-`, `SI-`, `LED-`, `PAY-`, `SET-`. An ID that does not match the pattern (a
 legacy row) is ignored rather than counted, and existing IDs are never rewritten.
+
+A bill or invoice number is built from the prefix in Settings. If the numbers
+already in the sheet carry a separator the setting does not (`PB` in Settings,
+`PB-001` in the sheet) the separator on the highest existing number is reused, so
+the next one is `PB-002` rather than `PB002`.
 
 ---
 

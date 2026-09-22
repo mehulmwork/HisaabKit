@@ -1564,15 +1564,25 @@ function nextIds(sheetName, count) {
 /**
  * Next document number for a bill or invoice, using the prefix configured in
  * Settings and skipping numbers already used by another record.
+ *
+ * The numbers already in the sheet may carry a separator the setting does not
+ * ("PB" in Settings, "PB-001" in the sheet), so the separator found on the
+ * highest existing number is reused for the next one.
  */
 function nextDocNumber(prefix, existing, field) {
-  const pattern = new RegExp('^' + String(prefix).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&') + '(\\d+)$', 'i');
+  const escaped = String(prefix).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+  const pattern = new RegExp('^' + escaped + '([-/_]?)(\\d+)$', 'i');
   let highest = 0;
+  let separator = '';
+
   (existing || []).forEach(rec => {
     const match = pattern.exec(String(rec[field] || '').trim());
-    if (match) highest = Math.max(highest, parseInt(match[1], 10));
+    if (!match) return;
+    const number = parseInt(match[2], 10);
+    if (number >= highest) { highest = number; separator = match[1] || ''; }
   });
-  return prefix + String(highest + 1).padStart(3, '0');
+
+  return prefix + separator + String(highest + 1).padStart(3, '0');
 }
 
 /* ---- applying sheet data to state ---- */
@@ -1600,47 +1610,71 @@ function mergeLocalExtras(incoming, localList, idField, preserved) {
 }
 
 /**
- * Account for stock the sheet holds but its ledger does not explain.
+ * Reconcile the ledger with the stock the sheet reports.
  *
  * The sheet's CurrentStock is authoritative, and the ledger only records what
  * this app has done since. An item that arrived with 50 in stock and has since
- * been bought (+5) and sold (-3) has three ledger rows totalling 2, while the
- * sheet still says 52. Without this, recalculateAllBalances() would trust the
- * ledger alone and rewrite the item's stock to 2.
+ * been bought (+5) and sold (-3) has ledger rows totalling 2, while the sheet
+ * still says 52. Without this, recalculateAllBalances() would trust the ledger
+ * alone and rewrite the item's stock to 2.
  *
- * So: for each item, work out what the ledger already accounts for, and if the
- * sheet shows more, put the difference in front of the ledger as a local
- * opening entry. Entries are local — they are never written to the sheet, and
- * they are rebuilt on every read.
+ * So for each item the difference between the sheet's CurrentStock and what the
+ * ledger accounts for is bridged with a local entry:
+ *
+ *   sheet higher  an Opening Stock row, dated before the item's first movement,
+ *                 because the stock was there before the app recorded anything;
+ *   sheet lower   a Correction row, dated last, because stock the ledger counted
+ *                 is no longer in the sheet — a stock take, or an edit made in
+ *                 the spreadsheet.
+ *
+ * Both are local: they are never written to the sheet, and they are rebuilt on
+ * every read, so this always follows whatever the sheet currently says.
  */
 function ensureOpeningLedger() {
   const opening = [];
+  const corrections = [];
 
   state.items.forEach(item => {
     const mine = state.ledger.filter(l => l.itemId === item.id);
     const net = round2(mine.reduce((total, row) => total + ledgerDelta(row), 0));
     const gap = round2(item.currentStock - net);
-    if (gap <= 0) return;
+    if (gap === 0) return;
 
-    // Date it before the item's earliest real movement, so the running
-    // balance reads in the right order.
     const dates = mine.map(l => l.date).filter(Boolean).sort();
-    opening.push({
-      id: 'LOCAL-OPENING-' + item.id,
-      itemId: item.id,
-      date: dates.length ? dates[0] : (item.createdAt || todayISO()),
-      reference: 'OPENING',
-      type: 'Opening Stock',
-      quantityIn: gap,
-      quantityOut: 0,
-      balance: item.currentStock,
-      unit: item.unit,
-      reason: 'Opening stock carried in the sheet, not in the ledger',
-      local: true
-    });
+
+    if (gap > 0) {
+      opening.push({
+        id: 'LOCAL-OPENING-' + item.id,
+        itemId: item.id,
+        date: dates.length ? dates[0] : (item.createdAt || todayISO()),
+        reference: 'OPENING',
+        type: 'Opening Stock',
+        quantityIn: gap,
+        quantityOut: 0,
+        balance: item.currentStock,
+        unit: item.unit,
+        reason: 'Opening stock carried in the sheet, not in the ledger',
+        local: true
+      });
+    } else {
+      corrections.push({
+        id: 'LOCAL-CORRECTION-' + item.id,
+        itemId: item.id,
+        date: todayISO(),
+        reference: 'SHEET',
+        type: 'Correction',
+        quantityIn: 0,
+        quantityOut: round2(-gap),
+        balance: item.currentStock,
+        unit: item.unit,
+        reason: 'Adjusts the ledger to the CurrentStock held in the spreadsheet',
+        local: true
+      });
+    }
   });
 
   if (opening.length) state.ledger = opening.concat(state.ledger);
+  if (corrections.length) state.ledger = state.ledger.concat(corrections);
 }
 
 /** Apply a full or partial set of sheet rows to state. */
