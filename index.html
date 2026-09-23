@@ -345,6 +345,8 @@ table.data tbody tr:last-child td{border-bottom:none;}
 .mono{font-variant-numeric:tabular-nums;}
 .td-strong{font-weight:600;color:var(--text-primary);}
 .td-sub{font-size:11px;color:var(--text-muted);}
+.link-cell{background:none;border:none;padding:0;font:inherit;font-weight:600;color:var(--primary);cursor:pointer;text-align:left;}
+.link-cell:hover{text-decoration:underline;}
 .td-actions{text-align:right;white-space:nowrap;}
 .col-check{width:38px;}
 tbody td.col-check{padding-left:14px;}
@@ -5039,6 +5041,11 @@ function renderParties(kind) {
       .join(' ').toLowerCase().includes(search);
   });
 
+  // Outstanding is worked out from the party's bills and payments, never read
+  // from a figure stored on the party row.
+  const outstanding = partyOutstandingMap(kind);
+  const totalOutstanding = round2(sum(all, p => outstanding[p.id] || 0));
+
   document.getElementById('view').innerHTML = `
     <div class="view-inner">
       <div class="page-head">
@@ -5055,6 +5062,9 @@ function renderParties(kind) {
       <div class="stat-grid">
         ${statCard({ tone:'blue',  icon:cfg.icon,       label:`Total ${cfg.plural}`, value:formatNumber(all.length), sub:'In your records' })}
         ${statCard({ tone:'amber', icon:'wallet',       label:'Opening Balance',    value:formatCurrency(round2(sum(all, p => p.openingBalance || 0))), sub:'Carried forward' })}
+        ${statCard({ tone: totalOutstanding > 0 ? 'red' : 'green', icon:'clock', label:'Outstanding',
+                     value: formatCurrency(totalOutstanding),
+                     sub: kind === 'supplier' ? 'You owe suppliers' : 'Owed to you' })}
         ${statCard({ tone:'green', icon:'check',        label:'With GSTIN',         value:formatNumber(all.filter(p => p.gstin).length), sub:'GST registered' })}
       </div>
 
@@ -5078,16 +5088,20 @@ function renderParties(kind) {
           <table class="data">
             <thead><tr>
               <th>Name</th><th>Phone</th><th>Email</th><th>GSTIN</th>
-              <th class="num">Opening Balance</th><th>Address</th><th class="td-actions">Actions</th>
+              <th class="num">Opening Balance</th><th class="num">Outstanding</th>
+              <th>Address</th><th class="td-actions">Actions</th>
             </tr></thead>
             <tbody>
               ${rows.length ? rows.map(p => `
                 <tr>
-                  <td class="td-strong">${escapeHtml(p.name)}</td>
+                  <td><button class="link-cell" type="button" data-open-party="${escapeHtml(p.id)}"
+                              title="Open the account for ${escapeHtml(p.name)}">${escapeHtml(p.name)}</button></td>
                   <td class="mono">${escapeHtml(p.phone || '—')}</td>
                   <td class="td-sub">${escapeHtml(p.email || '—')}</td>
                   <td class="mono td-sub">${escapeHtml(p.gstin || '—')}</td>
                   <td class="num">${formatCurrency(p.openingBalance || 0)}</td>
+                  <td class="num td-strong" style="color:${outstandingTone(outstanding[p.id] || 0)};"
+                      title="${escapeHtml(outstandingLabel(kind, outstanding[p.id] || 0))}">${formatCurrency(outstanding[p.id] || 0)}</td>
                   <td class="td-sub" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
                       title="${escapeHtml(p.address || '')}">${escapeHtml(p.address || '—')}</td>
                   <td class="td-actions">
@@ -5095,7 +5109,7 @@ function renderParties(kind) {
                       ${icon('more', 16)}
                     </button>
                   </td>
-                </tr>`).join('') : emptyRow(7, `No ${cfg.plural.toLowerCase()} found`,
+                </tr>`).join('') : emptyRow(8, `No ${cfg.plural.toLowerCase()} found`,
                   search ? 'Try a different search term.' : `Add your first ${cfg.label.toLowerCase()}.`)}
             </tbody>
           </table>
@@ -5123,8 +5137,13 @@ function renderParties(kind) {
   view.querySelector('#partyAdd').addEventListener('click', () => openPartyForm(kind, null));
   view.querySelector('#partyExport').addEventListener('click', () => {
     exportCSV(`hisabkit-${cfg.list}.csv`,
-      ['Name','Phone','Email','GSTIN','Opening Balance','Address'],
-      rows.map(p => [p.name, p.phone, p.email, p.gstin, p.openingBalance || 0, p.address]));
+      ['Name','Phone','Email','GSTIN','Opening Balance','Outstanding','Address'],
+      rows.map(p => [p.name, p.phone, p.email, p.gstin, p.openingBalance || 0,
+                     outstanding[p.id] || 0, p.address]));
+  });
+
+  view.querySelectorAll('[data-open-party]').forEach(btn => {
+    btn.addEventListener('click', () => openPartyAccount(kind, btn.dataset.openParty));
   });
 
   view.querySelectorAll('[data-party]').forEach(btn => {
@@ -5133,7 +5152,7 @@ function renderParties(kind) {
       const id = btn.dataset.party;
       openContextMenu(btn, [
         { label:`Edit ${cfg.label}`,   icon:'edit',   onClick:() => openPartyForm(kind, id) },
-        { label:`View Ledger`,         icon:'ledger', onClick:() => openPartyLedger(kind, id) },
+        { label:`View Account`,        icon:'ledger', onClick:() => openPartyAccount(kind, id) },
         '---',
         { label:`Delete ${cfg.label}`, icon:'trash', danger:true, onClick:() => confirmDeleteParty(kind, id) }
       ]);
@@ -5175,14 +5194,25 @@ function openPartyForm(kind, id) {
             <label for="ptAddress">Address</label>
             <textarea class="textarea" id="ptAddress" name="address">${escapeHtml(d.address)}</textarea>
           </div>
-          <div class="field span-2">
+          <div class="field">
             <label for="ptBalance">Opening Balance</label>
             <div class="input-affix">
               <span class="prefix">₹</span>
               <input class="input" id="ptBalance" name="openingBalance" type="number" step="0.01"
                      value="${d.openingBalance || 0}">
             </div>
-            <span class="hint">Positive = they owe you. Negative = you owe them.</span>
+          </div>
+          <div class="field">
+            <label for="ptBalanceType">Balance Type</label>
+            <select class="select" id="ptBalanceType" name="balanceType">
+              <option value="Debit" ${String(d.balanceType || 'Debit').toLowerCase() !== 'credit' ? 'selected' : ''}>
+                ${kind === 'supplier' ? 'Payable — you owe the supplier' : 'Receivable — the customer owes you'}
+              </option>
+              <option value="Credit" ${String(d.balanceType || '').toLowerCase() === 'credit' ? 'selected' : ''}>
+                ${kind === 'supplier' ? 'Advance — already paid to the supplier' : 'Credit — customer has paid ahead'}
+              </option>
+            </select>
+            <span class="hint">Amount is always positive here; the type decides which way it goes.</span>
           </div>
         </div>
       </form>`,
@@ -5204,6 +5234,7 @@ function openPartyForm(kind, id) {
           email: (fd.get('email') || '').trim(),
           address: (fd.get('address') || '').trim(),
           gstin: (fd.get('gstin') || '').trim().toUpperCase(),
+          balanceType: fd.get('balanceType') || 'Debit',
           openingBalance: round2(Number(fd.get('openingBalance')) || 0)
         };
 
@@ -5225,7 +5256,6 @@ function openPartyForm(kind, id) {
             } else {
               await repoCreate(sheetName, Object.assign({
                 id: nextId(sheetName),
-                balanceType: 'Debit',
                 creditLimit: 0,
                 status: 'Active'
               }, data));
@@ -5243,53 +5273,498 @@ function openPartyForm(kind, id) {
   });
 }
 
-/** Ledger of purchases/sales for one party, from the transaction records. */
-function openPartyLedger(kind, id) {
+/* ============================================================
+   7h. PARTY ACCOUNTS — supplier and customer ledgers
+
+   A party account is derived, never stored. Every figure on it is worked out
+   from the party row, the bills or invoices raised against that party, and the
+   payments that name it, so the account cannot drift away from the
+   transactions the way a saved balance can.
+
+   Which side an entry falls on follows the usual accounting reading:
+
+     supplier   a purchase, and an opening balance payable, increase what is
+                owed to the supplier (debit); paying the supplier clears it
+                (credit).
+     customer   a sale, and an opening balance receivable, increase what the
+                customer owes (debit); being paid clears it (credit).
+
+   Outstanding is therefore total debit less total credit, on both sides.
+   ============================================================ */
+
+/** 'supplier'/'Supplier'/'suppliers' all mean the same account. */
+function normalizePartyKind(partyType) {
+  return String(partyType || '').trim().toLowerCase().indexOf('sup') === 0 ? 'supplier' : 'customer';
+}
+
+/**
+ * Which side of the account the opening balance belongs on. BalanceType is
+ * whatever the sheet holds — Payable/Receivable, or Debit/Credit as the party
+ * form writes it — and a supplier's payable and a customer's receivable are
+ * both money owed to the business, so both land on the debit side. A balance on
+ * the other side, a supplier paid in advance or a customer in credit, reduces
+ * the outstanding figure instead.
+ *
+ * A negative opening balance reverses the side, matching the party form's own
+ * note that a negative figure means the money is owed the other way.
+ */
+function partyOpeningSide(kind, balanceType, amount) {
+  const type = String(balanceType || '').trim().toLowerCase();
+  const against = kind === 'supplier' ? 'receivable' : 'payable';
+
+  let side = (type === 'credit' || type === against) ? 'credit' : 'debit';
+  if (Number(amount) < 0) side = side === 'debit' ? 'credit' : 'debit';
+  return side;
+}
+
+/** The opening balance as a ledger entry, or null when there is none. */
+function partyOpeningEntry(kind, party) {
+  const amount = round2(Number(party.openingBalance) || 0);
+  if (!amount) return null;
+
+  const side = partyOpeningSide(kind, party.balanceType, amount);
+  const value = Math.abs(amount);
+  const type = String(party.balanceType || '').trim();
+
+  return {
+    date: party.createdAt || '',
+    type: 'Opening Balance',
+    reference: 'OPENING',
+    description: 'Balance carried into HisabKit' + (type ? ' (' + type + ')' : ''),
+    debit: side === 'debit' ? value : 0,
+    credit: side === 'credit' ? value : 0,
+    source: kind === 'supplier' ? 'Suppliers' : 'Customers',
+    sourceId: party.id,
+    documentId: ''
+  };
+}
+
+/** A purchase bill or sales invoice as a ledger entry. */
+function partyDocumentEntry(kind, doc) {
+  const buying = kind === 'supplier';
+  const number = (buying ? doc.billNumber : doc.invoiceNumber) || doc.id;
+  return {
+    date: doc.date,
+    type: buying ? 'Purchase' : 'Sale',
+    reference: number,
+    description: (buying ? 'Purchase bill ' : 'Sales invoice ') + number,
+    debit: round2(Number(doc.total) || 0),
+    credit: 0,
+    source: buying ? 'Purchases' : 'Sales',
+    sourceId: doc.id,
+    documentId: doc.id
+  };
+}
+
+/**
+ * The bill or invoice a payment names, when it names one that exists and
+ * belongs to the same party. ReferenceID is optional — a general payment has
+ * none, and still belongs in the account.
+ */
+function linkedDocument(kind, payment) {
+  if (!payment.referenceId) return null;
+
+  const buying = kind === 'supplier';
+  const wantsSale = String(payment.referenceType || '').trim().toLowerCase() === 'sale';
+  if (buying === wantsSale) return null;
+
+  const list = buying ? state.purchases : state.sales;
+  const doc = list.find(d => d.id === payment.referenceId) || null;
+  if (!doc) return null;
+  return ((buying ? doc.supplierId : doc.customerId) === payment.partyId) ? doc : null;
+}
+
+/** Every payment that belongs to this party, linked to a document or not. */
+function partyPaymentsFor(kind, partyId) {
+  const wanted = kind === 'supplier' ? 'supplier' : 'customer';
+  return state.payments.filter(p =>
+    String(p.partyType || '').trim().toLowerCase() === wanted && p.partyId === partyId);
+}
+
+/**
+ * A payment as a ledger entry. Paying a supplier, and being paid by a customer,
+ * clears what is owed (credit). The same payment type the other way round — a
+ * refund, or an advance handed back — adds to it instead (debit).
+ */
+function partyPaymentEntry(kind, payment) {
+  const buying = kind === 'supplier';
+  const amount = round2(Number(payment.amount) || 0);
+  const clears = buying ? payment.transactionType !== 'Received' : payment.transactionType !== 'Paid';
+  const doc = linkedDocument(kind, payment);
+  const number = doc ? ((buying ? doc.billNumber : doc.invoiceNumber) || doc.id) : '';
+
+  return {
+    date: payment.date,
+    type: 'Payment',
+    reference: number || payment.id,
+    description: (buying ? 'Paid to supplier' : 'Received from customer')
+      + (payment.paymentMode ? ' by ' + payment.paymentMode : '')
+      + (number ? ' against ' + number : ' — general payment')
+      + (payment.notes ? ' — ' + payment.notes : ''),
+    debit: clears ? 0 : amount,
+    credit: clears ? amount : 0,
+    source: 'Payments',
+    sourceId: payment.id,
+    documentId: doc ? doc.id : ''
+  };
+}
+
+/**
+ * One party's account: the opening balance, every bill, invoice and payment in
+ * date order, the running balance on each line, and the totals. The account
+ * view and the party lists both read from this, so a supplier and a customer
+ * account cannot disagree about the same payment.
+ */
+function buildPartyAccount(partyType, partyId) {
+  const kind = normalizePartyKind(partyType);
   const cfg = partyConfig(kind);
-  const party = state[cfg.list].find(p => p.id === id);
-  if (!party) return;
+  const party = state[cfg.list].find(p => p.id === partyId);
+  if (!party) return null;
 
-  const isSupplier = kind === 'supplier';
-  const txns = (isSupplier ? state.purchases : state.sales)
-    .filter(t => (isSupplier ? t.supplierId : t.customerId) === id)
-    .sort((a, b) => (a.date < b.date ? 1 : -1));
+  const buying = kind === 'supplier';
+  const docs = (buying ? state.purchases : state.sales)
+    .filter(d => (buying ? d.supplierId : d.customerId) === partyId);
+  const payments = partyPaymentsFor(kind, partyId);
 
-  const totalValue = round2(sum(txns, t => t.total));
-  const totalPaid  = round2(sum(txns, t => t.paid));
-  const outstanding = round2(totalValue - totalPaid);
+  const entries = [];
+  const opening = partyOpeningEntry(kind, party);
+  if (opening) entries.push(opening);
+  docs.forEach(d => entries.push(partyDocumentEntry(kind, d)));
+  payments.forEach(p => entries.push(partyPaymentEntry(kind, p)));
+
+  // Oldest first, with the opening balance ahead of anything dated the same day.
+  entries.sort((a, b) => {
+    const aOpening = a.type === 'Opening Balance';
+    const bOpening = b.type === 'Opening Balance';
+    if (aOpening !== bOpening) return aOpening ? -1 : 1;
+    if (a.date === b.date) return 0;
+    return a.date < b.date ? -1 : 1;
+  });
+
+  let running = 0;
+  let documentTotal = 0;
+  let paymentTotal = 0;
+
+  const transactions = entries.map(entry => {
+    running = round2(running + entry.debit - entry.credit);
+    if (entry.source === 'Payments') paymentTotal = round2(paymentTotal + entry.credit - entry.debit);
+    else if (entry.type !== 'Opening Balance') documentTotal = round2(documentTotal + entry.debit - entry.credit);
+    return Object.assign({}, entry, { balance: running });
+  });
+
+  const totalDebit = round2(sum(transactions, t => t.debit));
+  const totalCredit = round2(sum(transactions, t => t.credit));
+
+  return {
+    party:              party,
+    kind:               kind,
+    partyType:          buying ? 'Supplier' : 'Customer',
+    openingBalance:     round2(Number(party.openingBalance) || 0),
+    transactions:       transactions,
+    totalDebit:         totalDebit,
+    totalCredit:        totalCredit,
+    documentTotal:      documentTotal,
+    documentCount:      docs.length,
+    paymentTotal:       paymentTotal,
+    paymentCount:       payments.length,
+    returnsTotal:       0,
+    outstandingBalance: round2(totalDebit - totalCredit)
+  };
+}
+
+/**
+ * Outstanding per party for the party lists. The same classification as the
+ * account above, without building a running balance for every row.
+ */
+function partyOutstandingMap(kind) {
+  const cfg = partyConfig(kind);
+  const buying = kind === 'supplier';
+  const map = Object.create(null);
+
+  state[cfg.list].forEach(party => {
+    const opening = partyOpeningEntry(kind, party);
+    map[party.id] = opening ? round2(opening.debit - opening.credit) : 0;
+  });
+
+  (buying ? state.purchases : state.sales).forEach(doc => {
+    const id = buying ? doc.supplierId : doc.customerId;
+    if (map[id] === undefined) return;
+    const entry = partyDocumentEntry(kind, doc);
+    map[id] = round2(map[id] + entry.debit - entry.credit);
+  });
+
+  state.payments.forEach(payment => {
+    const wanted = buying ? 'supplier' : 'customer';
+    if (String(payment.partyType || '').trim().toLowerCase() !== wanted) return;
+    if (map[payment.partyId] === undefined) return;
+    const entry = partyPaymentEntry(kind, payment);
+    map[payment.partyId] = round2(map[payment.partyId] + entry.debit - entry.credit);
+  });
+
+  return map;
+}
+
+/** How an outstanding figure reads. */
+function outstandingLabel(kind, amount) {
+  const value = round2(amount);
+  if (value === 0) return 'Settled';
+  if (value > 0) return kind === 'supplier' ? 'You owe' : 'Owed to you';
+  return kind === 'supplier' ? 'Paid in advance' : 'Customer in credit';
+}
+
+/** Colour for an outstanding figure: red while owed, green once settled or in credit. */
+function outstandingTone(amount) {
+  const value = round2(amount);
+  if (value === 0) return 'var(--text-secondary)';
+  return value > 0 ? 'var(--danger)' : 'var(--success)';
+}
+
+/**
+ * The account view: the party, the summary, and the full transaction ledger.
+ * Filters narrow the rows on screen; the running balance and the totals always
+ * come from the whole account, so a filtered view can never change what is owed.
+ */
+function openPartyAccount(kind, id) {
+  const account = buildPartyAccount(kind, id);
+  if (!account) return;
+
+  const buying = kind === 'supplier';
+  const party = account.party;
+  const filter = { from: '', to: '', type: '', ref: '' };
+  const typeChoices = ['Opening Balance', buying ? 'Purchase' : 'Sale', 'Payment'];
+
+  function filtered() {
+    return account.transactions.filter(t => {
+      if (filter.from && t.date < filter.from) return false;
+      if (filter.to && t.date > filter.to) return false;
+      if (filter.type && t.type !== filter.type) return false;
+      if (filter.ref) {
+        const haystack = [t.reference, t.description, t.sourceId, t.type].join(' ').toLowerCase();
+        if (haystack.indexOf(filter.ref.toLowerCase()) === -1) return false;
+      }
+      return true;
+    });
+  }
+
+  function tableHtml() {
+    const rows = filtered();
+    const shell = inner => `<div class="table-scroll"
+      style="border:1px solid var(--border);border-radius:var(--radius);"><table class="data">${inner}</table></div>`;
+
+    if (!rows.length) {
+      return shell(`<tbody>${emptyRow(7, 'No transactions', account.transactions.length
+        ? 'No transaction matches these filters.'
+        : `No ${buying ? 'purchases' : 'sales'} or payments recorded for this party yet.`)}</tbody>`);
+    }
+
+    return shell(`
+      <thead><tr>
+        <th>Date</th><th>Type</th><th>Reference</th><th>Description</th>
+        <th class="num">Debit</th><th class="num">Credit</th><th class="num">Balance</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map(t => `
+          <tr ${t.documentId ? `data-doc="${escapeHtml(t.documentId)}" tabindex="0" style="cursor:pointer;"` : ''}>
+            <td>${t.date ? formatDate(t.date) : '—'}</td>
+            <td>${escapeHtml(t.type)}</td>
+            <td class="mono td-sub">${escapeHtml(t.reference)}</td>
+            <td class="td-sub">${escapeHtml(t.description)}</td>
+            <td class="num">${t.debit ? formatCurrency(t.debit) : '—'}</td>
+            <td class="num" style="color:${t.credit ? 'var(--success)' : 'inherit'};">${t.credit ? formatCurrency(t.credit) : '—'}</td>
+            <td class="num td-strong" style="color:${outstandingTone(t.balance)};">${formatCurrency(t.balance)}</td>
+          </tr>`).join('')}
+      </tbody>
+      <tfoot>
+        <tr>
+          <td colspan="4" class="td-sub">Showing ${rows.length} of ${account.transactions.length}</td>
+          <td class="num td-strong">${formatCurrency(round2(sum(rows, t => t.debit)))}</td>
+          <td class="num td-strong">${formatCurrency(round2(sum(rows, t => t.credit)))}</td>
+          <td class="num td-strong" style="color:${outstandingTone(account.outstandingBalance)};">${formatCurrency(account.outstandingBalance)}</td>
+        </tr>
+      </tfoot>`);
+  }
 
   openModal({
-    title: `${party.name} — ${isSupplier ? 'Purchase' : 'Sales'} Ledger`,
+    title: `${party.name} — ${account.partyType} Account`,
     size: 'xl',
     body: `
-      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px;">
-        ${statCard({ tone:'blue',  icon:'receipt', label:'Total Business', value:formatCurrency(totalValue), sub:`${txns.length} transaction${txns.length === 1 ? '' : 's'}` })}
-        ${statCard({ tone:'green', icon:'check',   label: isSupplier ? 'Paid' : 'Received', value:formatCurrency(totalPaid), sub:'Settled' })}
-        ${statCard({ tone:'red',   icon:'clock',   label:'Outstanding', value:formatCurrency(outstanding), sub: isSupplier ? 'You owe' : 'Owed to you' })}
+      <div style="display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between;align-items:flex-start;margin-bottom:18px;">
+        <div>
+          <div class="td-strong" style="font-size:15px;">${escapeHtml(party.name)}</div>
+          <div class="td-sub" style="margin-top:4px;">
+            ${escapeHtml(party.phone || 'No phone')} · ${escapeHtml(party.email || 'No email')} · ${escapeHtml(party.gstin || 'No GSTIN')}
+          </div>
+          ${party.address ? `<div class="td-sub">${escapeHtml(party.address)}</div>` : ''}
+          <div class="td-sub">Opening balance ${formatCurrency(account.openingBalance)} · Credit limit ${formatCurrency(party.creditLimit || 0)}</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="stat-label">Current Outstanding</div>
+          <div class="stat-value" style="color:${outstandingTone(account.outstandingBalance)};">
+            ${formatCurrency(account.outstandingBalance)}
+          </div>
+          <div class="stat-sub">${outstandingLabel(kind, account.outstandingBalance)}</div>
+        </div>
+      </div>
+
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:18px;">
+        ${statCard({ tone:'amber', icon:'wallet', label:'Opening Balance',
+                     value: formatCurrency(account.openingBalance),
+                     sub: account.openingBalance ? 'Carried forward' : 'None' })}
+        ${statCard({ tone:'blue', icon:'receipt', label: buying ? 'Total Purchases' : 'Total Sales',
+                     value: formatCurrency(account.documentTotal),
+                     sub: account.documentCount + ' document' + (account.documentCount === 1 ? '' : 's') })}
+        ${statCard({ tone:'green', icon:'check', label: buying ? 'Total Payments Made' : 'Total Payments Received',
+                     value: formatCurrency(account.paymentTotal),
+                     sub: account.paymentCount + ' payment' + (account.paymentCount === 1 ? '' : 's') })}
+        ${statCard({ tone: account.outstandingBalance > 0 ? 'red' : 'green', icon:'clock', label:'Outstanding',
+                     value: formatCurrency(account.outstandingBalance),
+                     sub: outstandingLabel(kind, account.outstandingBalance) })}
+      </div>
+
+      <div class="filter-bar no-print">
+        <div class="filter-group">
+          <label for="acctFrom">Date From</label>
+          <input class="input w-140" id="acctFrom" type="date" value="">
+        </div>
+        <div class="filter-group">
+          <label for="acctTo">Date To</label>
+          <input class="input w-140" id="acctTo" type="date" value="">
+        </div>
+        <div class="filter-group">
+          <label for="acctType">Type</label>
+          <select class="select w-170" id="acctType">
+            <option value="">All Types</option>
+            ${typeChoices.map(t => `<option value="${t}">${t}</option>`).join('')}
+          </select>
+        </div>
+        <div class="filter-group">
+          <label for="acctRef">Reference</label>
+          <input class="input w-170" id="acctRef" type="search" placeholder="Bill, invoice, payment…">
+        </div>
+        <div class="filter-actions">
+          <button class="btn btn-ghost btn-sm" id="acctReset">${icon('reset', 14)} Reset</button>
+        </div>
+      </div>
+
+      <div id="acctTable">${tableHtml()}</div>
+      <p class="td-sub" style="margin-top:10px;">
+        Debit increases what ${buying ? 'you owe the supplier' : 'the customer owes you'};
+        credit reduces it. Click a purchase, sale or payment against a document to open it.
+      </p>`,
+    footer: `
+      <button class="btn btn-default" type="button" data-modal-close>Close</button>
+      <button class="btn btn-primary" type="button" id="acctPay">${icon('wallet', 15)} Record Payment</button>`,
+    onMount(el) {
+      const body = el.querySelector('#acctTable');
+
+      function redraw() {
+        body.innerHTML = tableHtml();
+        body.querySelectorAll('[data-doc]').forEach(row => {
+          const show = () => openDocumentView(kind, row.dataset.doc);
+          row.addEventListener('click', show);
+          row.addEventListener('keydown', e => { if (e.key === 'Enter') show(); });
+        });
+      }
+
+      function reread() {
+        filter.from = el.querySelector('#acctFrom').value;
+        filter.to = el.querySelector('#acctTo').value;
+        filter.type = el.querySelector('#acctType').value;
+        filter.ref = el.querySelector('#acctRef').value.trim();
+        redraw();
+      }
+
+      ['#acctFrom', '#acctTo', '#acctType'].forEach(sel =>
+        el.querySelector(sel).addEventListener('change', reread));
+      el.querySelector('#acctRef').addEventListener('input', debounce(reread, 200));
+      el.querySelector('#acctReset').addEventListener('click', () => {
+        el.querySelector('#acctFrom').value = '';
+        el.querySelector('#acctTo').value = '';
+        el.querySelector('#acctType').value = '';
+        el.querySelector('#acctRef').value = '';
+        reread();
+      });
+
+      el.querySelector('#acctPay').addEventListener('click', () => {
+        openPaymentForm({
+          partyType: account.partyType,
+          partyId: party.id,
+          amount: Math.max(0, account.outstandingBalance),
+          onSaved() {
+            closeModal();
+            showToast('Payment recorded successfully');
+            // Rebuild from the sheet's data, so the account on screen is the
+            // account as it now stands.
+            openPartyAccount(kind, id);
+          }
+        });
+      });
+
+      redraw();
+    }
+  });
+}
+
+/**
+ * One bill or invoice, opened from a party account. Read only — the entry
+ * screens own editing.
+ */
+function openDocumentView(kind, docId) {
+  const buying = kind === 'supplier';
+  const doc = (buying ? state.purchases : state.sales).find(d => d.id === docId);
+  if (!doc) return;
+
+  const number = (buying ? doc.billNumber : doc.invoiceNumber) || doc.id;
+  const party = buying ? supplierName(doc.supplierId) : customerName(doc.customerId);
+  const lines = doc.items || [];
+  const status = doc.balance <= 0 ? 'Paid' : doc.paid > 0 ? 'Partially Paid' : 'Unpaid';
+
+  openModal({
+    title: (buying ? 'Purchase bill ' : 'Invoice ') + number,
+    size: 'lg',
+    body: `
+      <div style="display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between;margin-bottom:16px;">
+        <div>
+          <div class="stat-label">${buying ? 'Supplier' : 'Customer'}</div>
+          <div class="td-strong">${escapeHtml(party || '—')}</div>
+          <div class="td-sub">${doc.date ? formatDate(doc.date) : ''}</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="stat-label">Status</div>
+          <div>${paymentBadge(status)}</div>
+          <div class="stat-sub">Due ${formatCurrency(doc.balance)}</div>
+        </div>
       </div>
 
       <div class="table-scroll" style="border:1px solid var(--border);border-radius:var(--radius);">
         <table class="data">
           <thead><tr>
-            <th>Date</th><th>Reference</th><th class="num">Total</th>
-            <th class="num">Paid</th><th class="num">Balance</th><th>Status</th>
+            <th>Item</th><th class="num">Qty</th><th class="num">Rate</th>
+            <th class="num">Tax</th><th class="num">Amount</th>
           </tr></thead>
           <tbody>
-            ${txns.length ? txns.map(t => {
-              const status = t.balance <= 0 ? 'Paid' : t.paid > 0 ? 'Partially Paid' : 'Unpaid';
-              return `
-                <tr>
-                  <td>${formatDate(t.date)}</td>
-                  <td class="mono td-sub">${escapeHtml(isSupplier ? t.billNumber : t.invoiceNumber)}</td>
-                  <td class="num td-strong">${formatCurrency(t.total)}</td>
-                  <td class="num" style="color:var(--success);">${formatCurrency(t.paid)}</td>
-                  <td class="num" style="color:${t.balance > 0 ? 'var(--danger)' : 'var(--text-secondary)'};">${formatCurrency(t.balance)}</td>
-                  <td>${paymentBadge(status)}</td>
-                </tr>`;
-            }).join('') : emptyRow(6, 'No transactions', `No ${isSupplier ? 'purchases' : 'sales'} recorded for this party yet.`)}
+            ${lines.length ? lines.map(li => `
+              <tr>
+                <td class="td-strong">${escapeHtml(itemName(li.itemId))}</td>
+                <td class="num">${formatNumber(li.quantity)} ${escapeHtml(li.unit || '')}</td>
+                <td class="num">${formatCurrency(li.price)}</td>
+                <td class="num td-sub">${formatCurrency(li.taxAmount || 0)}</td>
+                <td class="num td-strong">${formatCurrency(li.total)}</td>
+              </tr>`).join('') : emptyRow(5, 'No lines', 'This document has no item lines.')}
           </tbody>
         </table>
-      </div>`,
+      </div>
+
+      <div style="margin-top:16px;margin-left:auto;max-width:320px;">
+        <div class="kv-row"><span class="k">Sub total</span><span class="v">${formatCurrency(doc.subTotal)}</span></div>
+        ${doc.discount ? `<div class="kv-row"><span class="k">Discount</span><span class="v">−${formatCurrency(doc.discount)}</span></div>` : ''}
+        <div class="kv-row"><span class="k">Tax</span><span class="v">${formatCurrency(doc.taxAmount)}</span></div>
+        <div class="kv-row"><span class="k"><strong>Total</strong></span><span class="v"><strong>${formatCurrency(doc.total)}</strong></span></div>
+        <div class="kv-row"><span class="k">Paid</span><span class="v">${formatCurrency(doc.paid)}</span></div>
+        <div class="kv-row"><span class="k">Due</span><span class="v">${formatCurrency(doc.balance)}</span></div>
+      </div>
+
+      ${doc.notes ? `<p class="td-sub" style="margin-top:12px;">${escapeHtml(doc.notes)}</p>` : ''}`,
     footer: `<button class="btn btn-default" type="button" data-modal-close>Close</button>`
   });
 }
@@ -6235,8 +6710,14 @@ function renderPayments() {
 /**
  * Record a payment by hand. The party list follows the Party Type chosen, and
  * picking one of the party's unpaid bills fills in the balance due.
+ *
+ * Passing { partyType, partyId, amount, onSaved } opens the form already set up
+ * for one party — the party account uses that to raise a payment without the
+ * user having to find the party again. onSaved replaces the default
+ * close-and-rerender, so the caller can refresh whatever view is underneath.
  */
-function openPaymentForm() {
+function openPaymentForm(opts) {
+  const options = opts || {};
   const body = `
     <form id="pmtForm" novalidate>
       <div class="form-grid">
@@ -6339,6 +6820,14 @@ function openPaymentForm() {
       });
 
       refreshParties();
+
+      // Opened for a particular party: fill in the party, and the amount owed.
+      if (options.partyType) typeSel.value = options.partyType === 'Supplier' ? 'Supplier' : 'Customer';
+      refreshParties();
+      if (options.partyId) partySel.value = options.partyId;
+      refreshReferences();
+      if (options.amount) amountIn.value = round2(options.amount);
+
       amountIn.focus();
 
       form.addEventListener('submit', async e => {
@@ -6369,6 +6858,8 @@ function openPaymentForm() {
         }));
 
         if (!res.ok) { showToast(res.message, 'error'); return; }
+
+        if (typeof options.onSaved === 'function') { options.onSaved(); return; }
 
         closeModal();
         showToast('Payment recorded successfully');

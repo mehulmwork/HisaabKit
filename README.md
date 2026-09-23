@@ -80,7 +80,8 @@ worse than not saving it.
 | **Inventory** — item catalogue, summary cards, search / category / stock-status / supplier filters, sortable paginated table, row action menu | Working, sheet-backed |
 | **Items** — add, edit, delete (with reference checks), auto-generated SKU, GST rate, low-stock level, opening stock written to the ledger | Working, sheet-backed |
 | **Categories** — list, add, edit, delete, Active/Inactive, item counts and values per category; the item form's Category dropdown is built from this sheet | Working, sheet-backed |
-| **Customers** and **Suppliers** — list, add, edit, delete, search, opening balance, credit limit, GSTIN | Working, sheet-backed |
+| **Customers** and **Suppliers** — list, add, edit, delete, search, opening balance and balance type, credit limit, GSTIN, outstanding worked out from the transactions | Working, sheet-backed |
+| **Party accounts** — open a supplier or customer for its ledger: opening balance, every bill or invoice, every payment, running balance, filters, and the document behind a line | Working, derived from the sheet |
 | **Purchase Bills** — multi-line entry with a supplier dropdown, GST, discount and round-off; saving increases stock, writes a ledger row per line, and records a payment when part of the bill is paid | Working, sheet-backed |
 | **Sales Invoices** — the same entry flow, validated against available stock, so an invoice can never take stock below zero | Working, sheet-backed |
 | **Stock Ledger** — every movement with a running balance, filterable by item, date range and transaction type | Working, sheet-backed |
@@ -90,6 +91,29 @@ worse than not saving it.
 | **Reports** — Stock Report with date, category and item filters | Working |
 | **Export & Print** — CSV export (UTF-8 BOM so Excel reads `₹` correctly) and print stylesheets | Working |
 | **Cash & Bank**, **Sales Returns**, **Purchase Returns**, **Purchase / Sales / Profit reports** | Placeholder navigation — reserved for a later phase |
+
+### Party accounts
+
+A supplier's or customer's account is **derived, never stored**. `buildPartyAccount(partyType, partyId)`
+gathers the party row, the bills or invoices raised against that party, and every payment
+that names it, normalizes all of them into one set of ledger entries, sorts them by date
+and works out the running balance. Outstanding is total debit less total credit, so the
+figure on screen is always the sum of the transactions behind it.
+
+* **Supplier** — a purchase, and an opening balance payable, increase what is owed
+  (debit); paying the supplier reduces it (credit).
+* **Customer** — a sale, and an opening balance receivable, increase what the customer
+  owes (debit); being paid reduces it (credit).
+
+A payment is matched to a party by **`PartyType` + `PartyID`**, never by `ReferenceID`.
+`ReferenceID` only links it to a particular bill or invoice when there is one, so a
+general payment, an advance or an opening adjustment still appears in the account. The
+`BalanceType` column decides which side an opening balance falls on, so a supplier paid
+in advance, or a customer in credit, reads as money owed the other way.
+
+Because nothing is stored, nothing can go stale: every write re-reads the sheet, the
+party lists recompute their outstanding column on each render, and recording a payment
+from inside an account rebuilds that account straight away.
 
 ### Correctness note
 
