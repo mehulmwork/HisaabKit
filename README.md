@@ -81,15 +81,15 @@ worse than not saving it.
 | **Items** — add, edit, delete (with reference checks), auto-generated SKU, GST rate, low-stock level, opening stock written to the ledger | Working, sheet-backed |
 | **Categories** — list, add, edit, delete, Active/Inactive, item counts and values per category; the item form's Category dropdown is built from this sheet | Working, sheet-backed |
 | **Customers** and **Suppliers** — list, add, edit, delete, search, opening balance and balance type, credit limit, GSTIN, outstanding worked out from the transactions | Working, sheet-backed |
-| **Party accounts** — open a supplier or customer for its ledger: opening balance, every bill or invoice, every payment, running balance, filters, and the document behind a line | Working, derived from the sheet |
-| **Purchase Bills** — multi-line entry with a supplier dropdown, GST, discount and round-off; saving increases stock, writes a ledger row per line, and records a payment when part of the bill is paid | Working, sheet-backed |
-| **Sales Invoices** — the same entry flow, validated against available stock, so an invoice can never take stock below zero | Working, sheet-backed |
+| **Party accounts** — open a supplier or customer for its statement: opening balance, every bill or invoice, every payment, running balance, filters, the document behind a line, and a printable PDF of the same statement | Working, derived from the sheet |
+| **Purchase Bills** — multi-line entry with a supplier dropdown, GST, discount and round-off; saving increases stock, writes a ledger row per line, and records a payment when part of the bill is paid. A missing supplier or item can be created from the bill itself | Working, sheet-backed |
+| **Sales Invoices** — the same entry flow, validated against available stock, so an invoice can never take stock below zero; the same inline customer and item creation | Working, sheet-backed |
 | **Stock Ledger** — every movement with a running balance, filterable by item, date range and transaction type | Working, sheet-backed |
 | **Payments** — money received from customers and paid to suppliers, filterable, with a party dropdown that follows the party type and optional settlement against a specific bill or invoice | Working, sheet-backed |
 | **Settings** — business profile, currency symbol, tax defaults, invoice and purchase prefixes, low-stock alert, read from and written to the Settings sheet | Working, sheet-backed |
 | **Dashboard** — live totals for sales, purchases, inventory value, receivables, payables, customer and supplier counts, plus stock alerts and top movers | Working, live from the sheet |
 | **Reports** — Stock Report with date, category and item filters | Working |
-| **Export & Print** — CSV export (UTF-8 BOM so Excel reads `₹` correctly) and print stylesheets | Working |
+| **Export & Print** — CSV export (UTF-8 BOM so Excel reads `₹` correctly), print stylesheets, and a printable party statement | Working |
 | **Cash & Bank**, **Sales Returns**, **Purchase Returns**, **Purchase / Sales / Profit reports** | Placeholder navigation — reserved for a later phase |
 
 ### Party accounts
@@ -114,6 +114,76 @@ in advance, or a customer in credit, reads as money owed the other way.
 Because nothing is stored, nothing can go stale: every write re-reads the sheet, the
 party lists recompute their outstanding column on each render, and recording a payment
 from inside an account rebuilds that account straight away.
+
+### The party statement
+
+The account view is a statement with seven columns and nothing else:
+
+```
+Date | Type | Reference | Description | Debit | Credit | Balance
+```
+
+Debit is red, credit is green, and the balance stays neutral dark, because a statement
+is read for two things at once: which way the money moved, and where the account
+stands. The balance comes from the same normalized entries as every other figure on
+the screen — nothing is recomputed for the statement.
+
+Above the table is the party, its type and, when a date filter is on, the period the
+statement covers. Below it are **Total Debit**, **Total Credit** and **Closing
+Balance**, which always cover the whole account even when the table is filtered, so
+the totals never change just because a filter was set. The row `Type` text carries the
+same red or green as its amount; the row itself is not coloured.
+
+### Downloading the statement as a PDF
+
+**Download PDF** in the account view prints the same statement — the same seven
+columns, the same rows, the same totals — through the browser's own print engine, so
+the reader chooses *Save as PDF* in the print dialog.
+
+There is no PDF library. A client-side PDF generator would have to be added as a
+dependency, which the single-file, no-build deployment cannot carry, and most of them
+cannot draw `₹` without an embedded font. The browser already has the fonts, the
+layout engine and the page-breaking rules, so the statement is rendered into a hidden
+`#printRoot`, the rest of the app is hidden with a `printing` class on `<body>`, and
+`window.print()` is called.
+
+What that buys, and how it is arranged:
+
+* the print stylesheet hides every direct child of `<body>` except `#printRoot`, so
+  only the statement reaches the paper;
+* the column headings are a real `<thead>`, which the browser repeats at the top of
+  every page;
+* each row is `break-inside: avoid`, so no row is cut across a page break, and the
+  totals and the closing balance travel together as one unbreakable block;
+* `print-color-adjust: exact` keeps the red and green on paper and in the PDF;
+* a long description wraps inside its column instead of pushing the table wider.
+
+The file name is set on `document.title` just before printing, so the browser offers
+`Supplier-<Party Name>-Statement.pdf` or `Customer-<Party Name>-Statement.pdf`, with
+the name sanitized. The title is restored afterwards. Company name and contact come
+from the Settings sheet; if they are unconfigured the statement falls back to the
+app's own identity rather than inventing one.
+
+Exporting reads the state the account view already holds: it makes no API call and
+changes nothing in the sheet.
+
+### Adding a supplier or an item from inside a bill
+
+A bill should not have to be abandoned because the supplier or the item behind it does
+not exist yet. Next to the party dropdown and next to each line's item dropdown there
+is an **Add** button, opening the ordinary supplier or item form in a dialog **over**
+the bill — the bill stays open underneath, and comes back exactly as it was: lines,
+quantities, prices, discounts, tax, notes.
+
+Saving writes through the same repository the Suppliers and Items screens use, then
+refreshes the dropdown from the in-memory list and selects the new record, so no reload
+is needed. The dialog only closes on success; a failure leaves it open with the real
+error and the bill untouched.
+
+Two rules matter here. An item created this way carries no stock movement of its own —
+`Current Stock` on the inline form defaults to 0, and the purchase quantity raises
+stock when the **bill** is saved, so stock is never counted twice. And a supplier's
+opening balance is written once, on its own row, never as a payment.
 
 ### Correctness note
 
@@ -215,7 +285,7 @@ migrated to React/Next.js and a real database later without a rewrite:
 3. Utilities (currency, date, escaping)
 4. Persistence (`loadData`, `saveData`) and **4b. Google Sheets — API client and data access**
 5. Toast notifications, busy indicator, sync banner
-6. Modal system
+6. Modal system (dialogs, including one opened over another)
 7. Domain logic (stock status, ledger, items, purchases, sales, payments)
 8. Rendering (one `render*` function per page)
 9. Navigation and event listeners
@@ -254,6 +324,8 @@ changing it there changes every amount in the app. Dates display as `DD/MM/YYYY`
 
 ## Not in this phase
 
-Deliberately out of scope: users and authentication, real GST invoices, PDF
-generation, barcode scanning, batch/serial numbers, multiple warehouses, and full
-accounting. Sales Returns and Purchase Returns are navigation placeholders.
+Deliberately out of scope: users and authentication, real GST invoices, barcode
+scanning, batch/serial numbers, multiple warehouses, and full accounting. Sales Returns
+and Purchase Returns are navigation placeholders. A party statement prints through the
+browser rather than through a bundled PDF library — see **Downloading the statement as
+a PDF**.

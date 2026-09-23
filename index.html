@@ -636,7 +636,52 @@ tbody td.col-check{padding-left:14px;}
   .table-scroll{overflow:visible;}
   .badge{border:1px solid #999;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
   @page{margin:12mm;}
+  /* While a statement is being printed, the app is off the page entirely and
+     only the statement shows. */
+  body.printing > *:not(#printRoot) { display: none !important; }
+  body.printing #printRoot { display: block; }
+  body.printing .st-page * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
+/* ---- printed party statement ---- */
+#printRoot { display: none; }
+.st-page { font-family: var(--font); color: #101828; }
+.st-head { display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 20px; border-bottom: 2px solid #101828; padding-bottom: 10px; margin-bottom: 14px; }
+.st-biz { font-size: 16px; font-weight: 700; }
+.st-biz-sub { font-size: 11px; color: #475467; margin-top: 3px; }
+.st-doc { font-size: 13px; font-weight: 700; letter-spacing: .06em; text-align: right; }
+.st-meta { font-size: 11px; color: #475467; margin-top: 3px; text-align: right; }
+.st-party { display: flex; justify-content: space-between; gap: 20px;
+  font-size: 11.5px; margin-bottom: 12px; }
+.st-party b { display: block; font-size: 13px; margin-top: 2px; }
+.st-label { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: #667085; }
+table.st-table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+table.st-table thead { display: table-header-group; }
+table.st-table th { background: #F1F5F9; border: 1px solid #CBD5E1; padding: 7px 8px;
+  text-align: left; font-size: 9.5px; letter-spacing: .05em; text-transform: uppercase; color: #344054; }
+table.st-table td { border: 1px solid #E1E7EF; padding: 6px 8px; vertical-align: top; }
+table.st-table tbody tr { page-break-inside: avoid; break-inside: avoid; }
+.st-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.st-empty { text-align: center; color: #667085; padding: 18px 8px; }
+.st-totals { margin: 14px 0 0 auto; width: 300px; font-size: 11.5px;
+  border: 1px solid #CBD5E1; border-radius: 6px; overflow: hidden; }
+.st-totals div { display: flex; justify-content: space-between; gap: 12px;
+  padding: 7px 11px; border-bottom: 1px solid #E1E7EF; }
+.st-totals div:last-child { border-bottom: none; background: #F1F5F9; font-weight: 700; }
+/* The totals and the note travel together: a statement should never end with
+   the summary split across a page break, or a lone trailing line. */
+.st-foot { page-break-inside: avoid; break-inside: avoid; }
+.st-note { margin-top: 12px; font-size: 10px; color: #667085; }
+/* Debit is red, credit is green, the balance stays neutral — on screen and
+   on the printed statement. */
+.amt-debit { color: var(--danger); }
+.amt-credit { color: var(--success); }
+.amt-debit-text { color: var(--danger); }
+.amt-credit-text { color: var(--success); }
+.field-with-action { display: flex; gap: 8px; align-items: center; }
+.field-with-action .select { flex: 1; min-width: 0; }
+.field-with-action .btn { flex: none; white-space: nowrap; }
+
 .sync-bar {
   position: fixed; top: 0; left: 0; right: 0; z-index: 900;
   display: none; align-items: center; gap: 9px;
@@ -671,6 +716,8 @@ button .spinner { margin-right: 2px; vertical-align: -1px; }
 
 <div class="toast-root" id="toastRoot" role="status" aria-live="polite"></div>
 <div id="modalRoot"></div>
+<!-- Holds the printable statement while window.print() is running. -->
+<div id="printRoot" aria-hidden="true"></div>
 
 <script>
 "use strict";
@@ -1980,17 +2027,24 @@ function clearSyncBanner() {
 /* ============================================================
    6. MODAL SYSTEM
    ============================================================ */
+/* Dialogs stack. A form can open a second dialog on top of itself — a
+   supplier created from the purchase form, a document opened from an account
+   — and closing that one has to put the user back where they were rather
+   than tearing the whole chain down. `activeModal` stays the top of the
+   stack, so everything that asks which dialog is open keeps working. */
+let modalStack = [];
+let modalFocus = [];
 let activeModal = null;
-let lastFocused = null;
 
 /**
  * Open a modal.
  * opts: { title, body (html string), footer (html string), size, onMount(el), onSubmit }
  */
 function openModal(opts) {
-  closeModal();
+  // A plain dialog replaces whatever is open, as it always has. A stacked one
+  // is opened from inside another and leaves that one in place underneath.
+  if (!opts.stack) closeAllModals();
 
-  lastFocused = document.activeElement;
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
   overlay.setAttribute('role', 'dialog');
@@ -2010,6 +2064,8 @@ function openModal(opts) {
     </div>`;
 
   document.getElementById('modalRoot').appendChild(overlay);
+  modalStack.push(overlay);
+  modalFocus.push(document.activeElement);
   activeModal = overlay;
 
   overlay.addEventListener('mousedown', e => {
@@ -2029,11 +2085,22 @@ function openModal(opts) {
   return overlay;
 }
 
+/** Close the open dialog — the top one, when dialogs are stacked. */
 function closeModal() {
-  if (!activeModal) return;
-  activeModal.remove();
-  activeModal = null;
-  if (lastFocused && document.contains(lastFocused)) lastFocused.focus();
+  const overlay = modalStack.pop();
+  if (!overlay) return;
+
+  const focus = modalFocus.pop();
+  overlay.remove();
+  activeModal = modalStack.length ? modalStack[modalStack.length - 1] : null;
+
+  // Back to whatever opened the dialog that just closed.
+  if (focus && document.contains(focus)) focus.focus();
+}
+
+/** Close every open dialog. */
+function closeAllModals() {
+  while (modalStack.length) closeModal();
 }
 
 /** Confirmation dialog. Returns via callback so it stays promise-free. */
@@ -2217,7 +2284,7 @@ async function createItem(fields) {
     lowStockLevel: round2(fields.lowStockLevel) || 0,
     supplierId: fields.supplierId || '',
     description: fields.description || '',
-    sheetStatus: 'Active',
+    sheetStatus: fields.status || 'Active',
     createdAt: now,
     updatedAt: now
   };
@@ -2256,6 +2323,8 @@ async function createItem(fields) {
     state.items.push(item);
     saveData(['items']);
     queueWrite({ action: 'create', sheet: 'Items', data: itemToRow(item) });
+    // The caller may still want the record that was kept on this device.
+    err.localRecord = item;
     throw err;
   }
 }
@@ -2278,6 +2347,7 @@ async function updateItem(id, fields) {
     lowStockLevel: round2(fields.lowStockLevel) || 0,
     supplierId: fields.supplierId || '',
     description: fields.description || '',
+    sheetStatus: fields.status || item.sheetStatus || 'Active',
     updatedAt: todayISO()
   });
   if (stockDelta !== 0) next.currentStock = round2(item.currentStock + stockDelta);
@@ -3401,7 +3471,13 @@ function confirmDeleteItem(id) {
    ============================================================ */
 
 /** Add (itemId = null) or edit an existing item. */
-function openItemForm(itemId) {
+/**
+ * Add or edit an item. `options.stack` opens it on top of the form that asked
+ * for it, and `options.onSaved` takes over from the default close-and-redraw
+ * so the caller can select the new item in its own line.
+ */
+function openItemForm(itemId, options) {
+  const opts = options || {};
   const item = itemId ? findItem(itemId) : null;
   const isEdit = !!item;
   const d = item || {
@@ -3485,7 +3561,7 @@ function openItemForm(itemId) {
         <div class="form-section-title">Stock</div>
         <div class="form-grid">
           <div class="field">
-            <label for="iOpening">${isEdit ? 'Opening Stock' : 'Opening Stock'}</label>
+            <label for="iOpening">${opts.inline ? 'Current Stock' : 'Opening Stock'}</label>
             <input class="input" id="iOpening" name="openingStock" type="number" min="0" step="0.01"
                    value="${d.openingStock}" placeholder="0">
             <span class="hint">${isEdit
@@ -3497,6 +3573,13 @@ function openItemForm(itemId) {
             <input class="input" id="iLow" name="lowStockLevel" type="number" min="0" step="0.01"
                    value="${d.lowStockLevel}" placeholder="0">
             <span class="hint">Alert when stock falls to or below this.</span>
+          </div>
+          <div class="field">
+            <label for="iStatus">Status</label>
+            <select class="select" id="iStatus" name="status">
+              <option value="Active" ${String(d.sheetStatus || d.status || 'Active').toLowerCase() !== 'inactive' ? 'selected' : ''}>Active</option>
+              <option value="Inactive" ${String(d.sheetStatus || d.status || '').toLowerCase() === 'inactive' ? 'selected' : ''}>Inactive</option>
+            </select>
           </div>
           <div class="field span-2">
             <label for="iDesc">Description</label>
@@ -3516,6 +3599,7 @@ function openItemForm(itemId) {
   openModal({
     title: isEdit ? 'Edit Item' : 'Add New Item',
     size: 'lg',
+    stack: !!opts.stack,
     body, footer,
     onMount(el) {
       const form = el.querySelector('#itemForm');
@@ -3527,13 +3611,14 @@ function openItemForm(itemId) {
 
       form.addEventListener('submit', e => {
         e.preventDefault();
-        submitItemForm(form, itemId);
+        submitItemForm(form, itemId, opts);
       });
     }
   });
 }
 
-function submitItemForm(form, itemId) {
+function submitItemForm(form, itemId, options) {
+  const opts = options || {};
   const fd = new FormData(form);
   const data = {
     name: (fd.get('name') || '').trim(),
@@ -3547,6 +3632,7 @@ function submitItemForm(form, itemId) {
     openingStock: fd.get('openingStock'),
     lowStockLevel: fd.get('lowStockLevel'),
     supplierId: fd.get('supplierId'),
+    status: fd.get('status') || 'Active',
     description: (fd.get('description') || '').trim()
   };
 
@@ -3588,22 +3674,30 @@ function submitItemForm(form, itemId) {
 
   withBusyButton(submitBtn, itemId ? 'Updating…' : 'Saving…', async () => {
     try {
+      let saved;
       if (itemId) {
-        await updateItem(itemId, data);
+        saved = await updateItem(itemId, data);
         showToast('Item updated successfully');
       } else {
-        await createItem(data);
+        saved = await createItem(data);
         showToast('Item added successfully');
       }
       closeModal();
+      // Opened from another form: it takes over, so the form underneath keeps
+      // every line and figure it was holding.
+      if (typeof opts.onSaved === 'function') { opts.onSaved(saved); return; }
       render();
     } catch (err) {
       console.error('[HisabKit] saving item failed', err);
       if (!itemId) {
         // createItem() already kept the entry on this device and queued it.
         closeModal();
-        render();
         showToast('Google Sheets unreachable — item saved on this device and will sync later.', 'error');
+        if (typeof opts.onSaved === 'function' && err && err.localRecord) {
+          opts.onSaved(err.localRecord);
+          return;
+        }
+        render();
         return;
       }
       showToast(describeApiError(err, 'The item could not be updated.'), 'error');
@@ -4009,10 +4103,10 @@ function openTransactionForm(kind) {
   const isPurchase = kind === 'purchase';
   const title       = isPurchase ? 'Add Purchase' : 'New Sales Invoice';
   const partyLabel  = isPurchase ? 'Supplier' : 'Customer';
+  const partyKind   = isPurchase ? 'supplier' : 'customer';
   const partyField  = isPurchase ? 'supplierId' : 'customerId';
   const docLabel    = isPurchase ? 'Bill Number' : 'Invoice Number';
   const dateLabel   = isPurchase ? 'Bill Date' : 'Invoice Date';
-  const partyList   = isPurchase ? state.suppliers : state.customers;
 
   // Prefill the next document number from the prefix set in Settings, skipping
   // any number the sheet has already used.
@@ -4020,10 +4114,20 @@ function openTransactionForm(kind) {
     ? nextDocNumber(state.settings.purchasePrefix || 'PUR-', state.purchases, 'billNumber')
     : nextDocNumber(state.settings.invoicePrefix || 'INV-', state.sales, 'invoiceNumber');
 
-  const partyOpts = partyList.length
-    ? `<option value="">Select ${partyLabel.toLowerCase()}…</option>` +
-      partyList.map(p => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('')
-    : `<option value="">No ${partyLabel.toLowerCase()}s yet</option>`;
+  /* Read through the state each time: a supplier created from this form is
+     pushed onto the same list, so the dropdown can be rebuilt without a
+     reload and without holding a stale copy. */
+  function currentPartyList() { return isPurchase ? state.suppliers : state.customers; }
+
+  function partyOptions(selected) {
+    const list = currentPartyList();
+    if (!list.length) return `<option value="">No ${partyLabel.toLowerCase()}s yet</option>`;
+    return `<option value="">Select ${partyLabel.toLowerCase()}…</option>` +
+      list.map(p => `<option value="${p.id}" ${selected === p.id ? 'selected' : ''}>` +
+        `${escapeHtml(p.name)}</option>`).join('');
+  }
+
+  const partyOpts = partyOptions('');
 
   const body = `
     <form id="txnForm" novalidate>
@@ -4032,7 +4136,13 @@ function openTransactionForm(kind) {
         <div class="form-grid">
           <div class="field" data-field="${partyField}">
             <label for="tParty">${partyLabel} <span class="req">*</span></label>
-            <select class="select" id="tParty" name="${partyField}">${partyOpts}</select>
+            <div class="field-with-action">
+              <select class="select" id="tParty" name="${partyField}">${partyOpts}</select>
+              <button class="btn btn-default btn-sm" type="button" id="tAddParty"
+                      title="Create a ${partyLabel.toLowerCase()} without leaving this form">
+                ${icon('plus', 13)} Add ${partyLabel}
+              </button>
+            </div>
             <span class="err">Please select a ${partyLabel.toLowerCase()}</span>
           </div>
           <div class="field">
@@ -4054,10 +4164,10 @@ function openTransactionForm(kind) {
       <div class="form-section">
         <div class="form-section-title">Items</div>
         <div class="table-scroll" style="border:1px solid var(--border);border-radius:var(--radius);">
-          <table class="items-table" id="txnItems" style="min-width:860px;">
+          <table class="items-table" id="txnItems" style="min-width:960px;">
             <thead><tr>
               <th style="width:38px;">#</th>
-              <th style="min-width:210px;">Item</th>
+              <th style="min-width:300px;">Item</th>
               <th style="width:88px;">Qty</th>
               <th style="width:78px;">Unit</th>
               <th style="width:118px;">Price / Unit</th>
@@ -4158,9 +4268,15 @@ function openTransactionForm(kind) {
         tr.innerHTML = `
           <td class="line-no" style="color:var(--text-muted);font-size:12px;padding-left:12px;"></td>
           <td>
-            <select class="select line-item" aria-label="Item">
-              ${itemOptions(preset && preset.itemId, 'Select item…')}
-            </select>
+            <div class="field-with-action">
+              <select class="select line-item" aria-label="Item">
+                ${itemOptions(preset && preset.itemId, 'Select item…')}
+              </select>
+              <button class="btn btn-default btn-sm line-add-item" type="button"
+                      title="Create an item without leaving this form" aria-label="Add a new item">
+                ${icon('plus', 13)} Add
+              </button>
+            </div>
           </td>
           <td><input class="input line-qty" type="number" min="0" step="0.01" value="${preset ? preset.qty : ''}" placeholder="0" aria-label="Quantity"></td>
           <td class="line-unit" style="font-size:12px;color:var(--text-secondary);"></td>
@@ -4269,13 +4385,59 @@ function openTransactionForm(kind) {
         recalc();
       });
 
+      /* ---- creating a supplier or an item without leaving this form ----
+
+         Both open a dialog stacked on top of this one, and both put the new
+         record straight into the dropdown it came from, selected, with every
+         line, quantity, price, discount and note in this form left alone. */
+
+      el.querySelector('#tAddParty').addEventListener('click', () => {
+        openPartyForm(partyKind, null, {
+          stack: true,
+          inline: true,
+          onSaved(party) {
+            if (!party) return;
+            partySel.innerHTML = partyOptions(party.id);
+            partySel.value = party.id;
+            // Runs the same handler a manual choice does, so the phone fills in.
+            partySel.dispatchEvent(new Event('change', { bubbles: true }));
+            partySel.closest('.field').classList.remove('invalid');
+          }
+        });
+      });
+
+      linesEl.addEventListener('click', e => {
+        const btn = e.target.closest('.line-add-item');
+        if (!btn) return;
+        const tr = btn.closest('tr');
+
+        openItemForm(null, {
+          stack: true,
+          inline: true,
+          onSaved(item) {
+            if (!item) return;
+            // The new item belongs in every line's dropdown, and is chosen in
+            // the line the button was pressed on.
+            linesEl.querySelectorAll('.line-item').forEach(sel => {
+              const keep = sel.closest('tr') === tr ? item.id : sel.value;
+              sel.innerHTML = itemOptions(keep, 'Select item…');
+              sel.value = keep;
+            });
+            const sel = tr.querySelector('.line-item');
+            sel.value = item.id;
+            // Fills unit, price and tax the way picking the item by hand does.
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+      });
+
       el.querySelector('#addLine').addEventListener('click', () => addLine(null));
       discIn.addEventListener('input', recalc);
       paidIn.addEventListener('input', recalc);
 
       /* ---- party selection populates phone ---- */
       partySel.addEventListener('change', () => {
-        const p = partyList.find(x => x.id === partySel.value);
+        const p = currentPartyList().find(x => x.id === partySel.value);
         phoneIn.value = p ? (p.phone || '') : '';
       });
 
@@ -5160,7 +5322,14 @@ function renderParties(kind) {
   });
 }
 
-function openPartyForm(kind, id) {
+/**
+ * Add or edit a supplier or customer. `options.stack` opens it on top of the
+ * form that asked for it instead of replacing it, and `options.onSaved` takes
+ * over from the default close-and-redraw so the caller can put the new party
+ * into its own dropdown.
+ */
+function openPartyForm(kind, id, options) {
+  const opts = options || {};
   const cfg = partyConfig(kind);
   const list = state[cfg.list];
   const existing = id ? list.find(p => p.id === id) : null;
@@ -5169,6 +5338,7 @@ function openPartyForm(kind, id) {
 
   openModal({
     title: isEdit ? `Edit ${cfg.label}` : `Add ${cfg.label}`,
+    stack: !!opts.stack,
     body: `
       <form id="partyForm" novalidate>
         <div class="form-grid">
@@ -5214,6 +5384,22 @@ function openPartyForm(kind, id) {
             </select>
             <span class="hint">Amount is always positive here; the type decides which way it goes.</span>
           </div>
+          <div class="field">
+            <label for="ptLimit">Credit Limit</label>
+            <div class="input-affix">
+              <span class="prefix">₹</span>
+              <input class="input" id="ptLimit" name="creditLimit" type="number" min="0" step="0.01"
+                     value="${Number(d.creditLimit) || 0}">
+            </div>
+            <span class="hint">Leave 0 for no limit.</span>
+          </div>
+          <div class="field">
+            <label for="ptStatus">Status</label>
+            <select class="select" id="ptStatus" name="status">
+              <option value="Active" ${String(d.status || 'Active').toLowerCase() !== 'inactive' ? 'selected' : ''}>Active</option>
+              <option value="Inactive" ${String(d.status || '').toLowerCase() === 'inactive' ? 'selected' : ''}>Inactive</option>
+            </select>
+          </div>
         </div>
       </form>`,
     footer: `
@@ -5235,7 +5421,9 @@ function openPartyForm(kind, id) {
           address: (fd.get('address') || '').trim(),
           gstin: (fd.get('gstin') || '').trim().toUpperCase(),
           balanceType: fd.get('balanceType') || 'Debit',
-          openingBalance: round2(Number(fd.get('openingBalance')) || 0)
+          openingBalance: round2(Number(fd.get('openingBalance')) || 0),
+          creditLimit: round2(Number(fd.get('creditLimit')) || 0),
+          status: fd.get('status') || 'Active'
         };
 
         form.querySelectorAll('.field').forEach(f => f.classList.remove('invalid'));
@@ -5250,11 +5438,12 @@ function openPartyForm(kind, id) {
 
         withBusyButton(button, isEdit ? 'Updating…' : 'Saving…', async () => {
           try {
+            let saved;
             if (isEdit) {
-              await repoUpdate(sheetName, id, Object.assign({}, existing, data));
+              saved = await repoUpdate(sheetName, id, Object.assign({}, existing, data));
               showToast(`${cfg.label} updated successfully`);
             } else {
-              await repoCreate(sheetName, Object.assign({
+              saved = await repoCreate(sheetName, Object.assign({
                 id: nextId(sheetName),
                 creditLimit: 0,
                 status: 'Active'
@@ -5262,6 +5451,9 @@ function openPartyForm(kind, id) {
               showToast(`${cfg.label} added successfully`);
             }
             closeModal();
+            // Opened from another form: it takes over, so the page underneath
+            // is left exactly as it was.
+            if (typeof opts.onSaved === 'function') { opts.onSaved(saved); return; }
             render();
           } catch (err) {
             console.error('[HisabKit] saving ' + kind + ' failed', err);
@@ -5546,6 +5738,17 @@ function openPartyAccount(kind, id) {
     });
   }
 
+  /**
+   * Red for the side that increases what is owed — a purchase, a sale, an
+   * opening payable or receivable. Green for the side that clears it — a
+   * payment either way. Nothing else is coloured.
+   */
+  function sideTone(entry) {
+    if (entry.debit) return 'amt-debit';
+    if (entry.credit) return 'amt-credit';
+    return '';
+  }
+
   function tableHtml() {
     const rows = filtered();
     const shell = inner => `<div class="table-scroll"
@@ -5566,20 +5769,20 @@ function openPartyAccount(kind, id) {
         ${rows.map(t => `
           <tr ${t.documentId ? `data-doc="${escapeHtml(t.documentId)}" tabindex="0" style="cursor:pointer;"` : ''}>
             <td>${t.date ? formatDate(t.date) : '—'}</td>
-            <td>${escapeHtml(t.type)}</td>
+            <td class="${sideTone(t) ? sideTone(t) + '-text' : ''}">${escapeHtml(t.type)}</td>
             <td class="mono td-sub">${escapeHtml(t.reference)}</td>
             <td class="td-sub">${escapeHtml(t.description)}</td>
-            <td class="num">${t.debit ? formatCurrency(t.debit) : '—'}</td>
-            <td class="num" style="color:${t.credit ? 'var(--success)' : 'inherit'};">${t.credit ? formatCurrency(t.credit) : '—'}</td>
-            <td class="num td-strong" style="color:${outstandingTone(t.balance)};">${formatCurrency(t.balance)}</td>
+            <td class="num ${t.debit ? 'amt-debit' : ''}">${t.debit ? formatCurrency(t.debit) : '—'}</td>
+            <td class="num ${t.credit ? 'amt-credit' : ''}">${t.credit ? formatCurrency(t.credit) : '—'}</td>
+            <td class="num td-strong">${formatCurrency(t.balance)}</td>
           </tr>`).join('')}
       </tbody>
       <tfoot>
         <tr>
-          <td colspan="4" class="td-sub">Showing ${rows.length} of ${account.transactions.length}</td>
-          <td class="num td-strong">${formatCurrency(round2(sum(rows, t => t.debit)))}</td>
-          <td class="num td-strong">${formatCurrency(round2(sum(rows, t => t.credit)))}</td>
-          <td class="num td-strong" style="color:${outstandingTone(account.outstandingBalance)};">${formatCurrency(account.outstandingBalance)}</td>
+          <td colspan="4" class="td-sub">Showing ${rows.length} of ${account.transactions.length}${rows.length === account.transactions.length ? '' : ' — the totals below are for the whole account'}</td>
+          <td class="num td-strong amt-debit">${formatCurrency(account.totalDebit)}</td>
+          <td class="num td-strong amt-credit">${formatCurrency(account.totalCredit)}</td>
+          <td class="num td-strong">${formatCurrency(account.outstandingBalance)}</td>
         </tr>
       </tfoot>`);
   }
@@ -5652,6 +5855,7 @@ function openPartyAccount(kind, id) {
         credit reduces it. Click a purchase, sale or payment against a document to open it.
       </p>`,
     footer: `
+      <button class="btn btn-default" type="button" id="acctPdf">${icon('download', 15)} Download PDF</button>
       <button class="btn btn-default" type="button" data-modal-close>Close</button>
       <button class="btn btn-primary" type="button" id="acctPay">${icon('wallet', 15)} Record Payment</button>`,
     onMount(el) {
@@ -5685,6 +5889,10 @@ function openPartyAccount(kind, id) {
         reread();
       });
 
+      el.querySelector('#acctPdf').addEventListener('click', () => {
+        printPartyStatement(kind, account, filtered(), filter);
+      });
+
       el.querySelector('#acctPay').addEventListener('click', () => {
         openPaymentForm({
           partyType: account.partyType,
@@ -5703,6 +5911,149 @@ function openPartyAccount(kind, id) {
       redraw();
     }
   });
+}
+
+/* ============================================================
+   7h-2. PRINTED PARTY STATEMENT
+
+   The statement is the same seven columns the account shows, printed through
+   the browser. Nothing is generated here and nothing is sent anywhere: the
+   sheet is built in the page, window.print() hands it to the print dialog, and
+   it is thrown away afterwards. Pagination, the table header repeating on each
+   page and the rupee symbol are therefore the browser's own, which is what
+   keeps a long statement readable.
+   ============================================================ */
+
+/** A file name a browser will accept, for the printed statement. */
+function sanitizeFileName(name) {
+  return String(name || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'Statement';
+}
+
+/** The company block, from Settings, falling back to the app's own defaults. */
+function statementIdentity() {
+  const s = state.settings || {};
+  const bits = [s.phone, s.address, s.gstin ? 'GSTIN ' + s.gstin : ''].filter(Boolean);
+  return { name: s.businessName || 'My Business', line: bits.join('  ·  ') };
+}
+
+/**
+ * The printable statement. `rows` are the transactions the account is
+ * currently showing, so a filtered account prints what it is showing; the
+ * totals cover the whole account, exactly as the footer on screen does.
+ */
+function buildStatementHtml(kind, account, rows, filter) {
+  const buying = kind === 'supplier';
+  const identity = statementIdentity();
+  const party = account.party;
+
+  const period = filter && (filter.from || filter.to)
+    ? `<div class="st-meta">Period: ${filter.from ? formatDate(filter.from) : 'beginning'}
+       to ${filter.to ? formatDate(filter.to) : 'today'}</div>`
+    : '';
+
+  const body = rows.length
+    ? rows.map(t => `
+        <tr>
+          <td>${t.date ? formatDate(t.date) : '—'}</td>
+          <td class="${t.debit ? 'amt-debit-text' : t.credit ? 'amt-credit-text' : ''}">${escapeHtml(t.type)}</td>
+          <td>${escapeHtml(t.reference)}</td>
+          <td>${escapeHtml(t.description)}</td>
+          <td class="st-num ${t.debit ? 'amt-debit' : ''}">${t.debit ? formatCurrency(t.debit) : '—'}</td>
+          <td class="st-num ${t.credit ? 'amt-credit' : ''}">${t.credit ? formatCurrency(t.credit) : '—'}</td>
+          <td class="st-num">${formatCurrency(t.balance)}</td>
+        </tr>`).join('')
+    : `<tr><td colspan="7" class="st-empty">No transactions to show.</td></tr>`;
+
+  return `
+    <div class="st-page">
+      <div class="st-head">
+        <div>
+          <div class="st-biz">${escapeHtml(identity.name)}</div>
+          ${identity.line ? `<div class="st-biz-sub">${escapeHtml(identity.line)}</div>` : ''}
+        </div>
+        <div>
+          <div class="st-doc">PARTY ACCOUNT STATEMENT</div>
+          <div class="st-meta">Printed ${formatDate(todayISO())}</div>
+          ${period}
+        </div>
+      </div>
+
+      <div class="st-party">
+        <div><span class="st-label">Party Name</span><b>${escapeHtml(party.name)}</b></div>
+        <div><span class="st-label">Party Type</span><b>${escapeHtml(account.partyType)}</b></div>
+      </div>
+
+      <table class="st-table">
+        <colgroup>
+          <col style="width:11%"><col style="width:14%"><col style="width:13%">
+          <col style="width:29%"><col style="width:11%"><col style="width:11%">
+          <col style="width:11%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Date</th><th>Type</th><th>Reference</th><th>Description</th>
+            <th class="st-num">Debit</th><th class="st-num">Credit</th><th class="st-num">Balance</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+
+      <div class="st-foot">
+        <div class="st-totals">
+          <div><span>Total Debit</span><b class="amt-debit">${formatCurrency(account.totalDebit)}</b></div>
+          <div><span>Total Credit</span><b class="amt-credit">${formatCurrency(account.totalCredit)}</b></div>
+          <div><span>Closing Balance</span><b>${formatCurrency(account.outstandingBalance)}</b></div>
+        </div>
+
+        <div class="st-note">
+          Debit increases what ${buying ? 'the business owes the supplier' : 'the customer owes the business'};
+          credit reduces it. ${rows.length} of ${account.transactions.length} transactions listed.
+        </div>
+      </div>
+    </div>`;
+}
+
+/**
+ * Print a sheet built here, and put the page back afterwards. The document
+ * title is swapped for the duration, because that is the name the print
+ * dialog offers when the destination is "Save as PDF".
+ */
+function printHtml(html, fileName) {
+  const root = document.getElementById('printRoot');
+  if (!root) return;
+
+  const previousTitle = document.title;
+  let restored = false;
+
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    document.body.classList.remove('printing');
+    root.innerHTML = '';
+    document.title = previousTitle;
+    window.removeEventListener('afterprint', restore);
+  };
+
+  root.innerHTML = html;
+  document.body.classList.add('printing');
+  document.title = fileName;
+
+  window.addEventListener('afterprint', restore);
+  window.print();
+  // Some browsers never fire afterprint; put the page back either way.
+  setTimeout(restore, 60000);
+}
+
+/** Download the account on screen as Supplier-<name>-Statement.pdf. */
+function printPartyStatement(kind, account, rows, filter) {
+  const buying = kind === 'supplier';
+  const fileName = (buying ? 'Supplier-' : 'Customer-') +
+    sanitizeFileName(account.party.name) + '-Statement';
+  printHtml(buildStatementHtml(kind, account, rows, filter), fileName);
 }
 
 /**
