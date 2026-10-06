@@ -2425,6 +2425,17 @@ const supplierName = id => { const s = findSupplier(id); return s ? s.name : '�
 const customerName = id => { const c = findCustomer(id); return c ? c.name : '—'; };
 const itemName     = id => { const i = findItem(id); return i ? i.name : '—'; };
 
+/**
+ * The round-off on a bill or an invoice.
+ *
+ * The entry form works it out as the difference between the rounded total and
+ * the unrounded one, and the sheet has no column for it — the total it produced
+ * is stored and that is all. So it is read back out of the figures that are
+ * stored, which is the same arithmetic the form did, in reverse.
+ */
+const documentRoundOff = doc =>
+  round2(doc.total - (round2(doc.subTotal) + round2(doc.taxAmount) - round2(doc.discount)));
+
 /* ---- Stock calculations ---- */
 function calculateStockStatus(item) {
   if (!item) return 'Out of Stock';
@@ -5006,23 +5017,23 @@ function openViewPurchase(id) {
           <tbody>
             ${p.items.map(li => `
               <tr>
-                <td class="td-strong">${escapeHtml(li.name)}</td>
+                <td class="td-strong">${escapeHtml(itemName(li.itemId))}</td>
                 <td class="num">${formatNumber(li.quantity)}</td>
                 <td>${escapeHtml(li.unit)}</td>
                 <td class="num">${formatCurrency(li.price)}</td>
-                <td class="num">${li.gstRate}%</td>
+                <td class="num">${formatNumber(li.taxRate)}%</td>
                 <td class="num">${formatCurrency(li.taxAmount)}</td>
-                <td class="num td-strong">${formatCurrency(li.amount)}</td>
+                <td class="num td-strong">${formatCurrency(li.total)}</td>
               </tr>`).join('')}
           </tbody>
         </table>
       </div>
 
       <div class="totals-panel">
-        <div class="kv-row"><span class="k">Subtotal</span><span class="v">${formatCurrency(p.subtotal)}</span></div>
+        <div class="kv-row"><span class="k">Subtotal</span><span class="v">${formatCurrency(p.subTotal)}</span></div>
         <div class="kv-row"><span class="k">Discount</span><span class="v">${formatCurrency(p.discount)}</span></div>
-        <div class="kv-row"><span class="k">Tax (GST)</span><span class="v">${formatCurrency(p.tax)}</span></div>
-        <div class="kv-row"><span class="k">Round Off</span><span class="v">${formatCurrency(p.roundOff)}</span></div>
+        <div class="kv-row"><span class="k">Tax (GST)</span><span class="v">${formatCurrency(p.taxAmount)}</span></div>
+        <div class="kv-row"><span class="k">Round Off</span><span class="v">${formatCurrency(documentRoundOff(p))}</span></div>
         <div class="kv-row"><span class="k" style="font-weight:700;color:var(--text-primary);font-size:15px;">Total</span><span class="v" style="font-size:15px;">${formatCurrency(p.total)}</span></div>
         <div class="kv-row"><span class="k">Paid</span><span class="v" style="color:var(--success);">${formatCurrency(p.paid)}</span></div>
         <div class="kv-row"><span class="k">Balance Due</span><span class="v" style="color:${p.balance > 0 ? 'var(--danger)' : 'var(--success)'};">${formatCurrency(p.balance)}</span></div>
@@ -5334,23 +5345,23 @@ function openViewSale(id) {
           <tbody>
             ${s.items.map(li => `
               <tr>
-                <td class="td-strong">${escapeHtml(li.name)}</td>
+                <td class="td-strong">${escapeHtml(itemName(li.itemId))}</td>
                 <td class="num">${formatNumber(li.quantity)}</td>
                 <td>${escapeHtml(li.unit)}</td>
                 <td class="num">${formatCurrency(li.price)}</td>
-                <td class="num">${li.gstRate}%</td>
+                <td class="num">${formatNumber(li.taxRate)}%</td>
                 <td class="num">${formatCurrency(li.taxAmount)}</td>
-                <td class="num td-strong">${formatCurrency(li.amount)}</td>
+                <td class="num td-strong">${formatCurrency(li.total)}</td>
               </tr>`).join('')}
           </tbody>
         </table>
       </div>
 
       <div class="totals-panel">
-        <div class="kv-row"><span class="k">Subtotal</span><span class="v">${formatCurrency(s.subtotal)}</span></div>
+        <div class="kv-row"><span class="k">Subtotal</span><span class="v">${formatCurrency(s.subTotal)}</span></div>
         <div class="kv-row"><span class="k">Discount</span><span class="v">${formatCurrency(s.discount)}</span></div>
-        <div class="kv-row"><span class="k">Tax (GST)</span><span class="v">${formatCurrency(s.tax)}</span></div>
-        <div class="kv-row"><span class="k">Round Off</span><span class="v">${formatCurrency(s.roundOff)}</span></div>
+        <div class="kv-row"><span class="k">Tax (GST)</span><span class="v">${formatCurrency(s.taxAmount)}</span></div>
+        <div class="kv-row"><span class="k">Round Off</span><span class="v">${formatCurrency(documentRoundOff(s))}</span></div>
         <div class="kv-row"><span class="k" style="font-weight:700;color:var(--text-primary);font-size:15px;">Total</span><span class="v" style="font-size:15px;">${formatCurrency(s.total)}</span></div>
         <div class="kv-row"><span class="k">Received</span><span class="v" style="color:var(--success);">${formatCurrency(s.paid)}</span></div>
         <div class="kv-row"><span class="k">Balance Due</span><span class="v" style="color:${s.balance > 0 ? 'var(--danger)' : 'var(--success)'};">${formatCurrency(s.balance)}</span></div>
