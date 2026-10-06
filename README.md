@@ -62,6 +62,10 @@ them as **one `transaction` request**, and Apps Script:
 A purchase header therefore cannot be saved without its lines, and a failure part
 way through leaves the sheet exactly as it was.
 
+The response carries the tabs the batch wrote, as the sheet holds them, read under
+that same lock. The app applies those rows instead of spending a second round trip
+re-reading — see **Speed** below.
+
 ### Offline behaviour
 
 The Google Sheet is the source of truth. `localStorage` holds only the last
@@ -70,6 +74,52 @@ of master-data writes (items, categories, customers, suppliers) made while offli
 pushed on the next successful load. A purchase, sale or payment that fails is
 reported to the user instead of being queued — replaying half of one later would be
 worse than not saving it.
+
+### Speed
+
+An Apps Script round trip costs about a second whatever it carries, so what makes the
+app feel slow is the *number* of requests, not their size. Two rules follow.
+
+**A write never re-reads the whole workbook.** The startup read is still one `dump` of
+every tab, because that is one request either way. After that:
+
+| Action | Requests to Apps Script |
+| --- | --- |
+| Add an item, category, supplier or customer | the write alone |
+| Save a purchase, invoice or payment | the transaction alone — its response carries the tabs it wrote |
+| Save Settings | the transaction alone |
+| Open a page | none; every screen paints from memory |
+
+`dump` still accepts no arguments for a full read (the startup path, the Reload button).
+It also accepts `sheets=Items,Purchases`, which is how the app re-reads a few tabs at
+once when it needs to. A tab is never read without the tabs its rows are meaningless
+without: billing `Purchases` on its own would rebuild every bill with no lines on it,
+so `Sales_Items` and `Purchase_Items` travel with their parents automatically.
+
+**Repeats collapse.** Two parts of the screen asking for the same thing at the same
+moment share one request. Only reads are shared — two identical writes are two separate
+intentions and both reach the sheet.
+
+The other half of the trade is honesty about freshness. Before a form that commits money
+opens — a bill, an invoice, a payment — the lists it validates against are re-read if
+the copy in memory is more than five minutes old; usually it is not, so the form opens
+instantly. And a write that succeeds is never reported as a failure just because the
+refresh afterwards could not reach the sheet: the row is saved, and the banner says the
+figures on screen may be out of date instead.
+
+#### Measuring it
+
+Open the app with `?perf=1` (or set `localStorage.hisabkit_perf = '1'`) and the console
+has:
+
+```js
+HisabKitPerf.report()    // requests per action, and counters — full vs narrowed dumps
+HisabKitPerf.summary()   // min / median / max milliseconds per label
+HisabKitPerf.clear()
+```
+
+Timings are recorded only when that flag is set, so a normal visitor pays nothing and
+sees no debugging UI.
 
 ---
 
@@ -111,9 +161,9 @@ general payment, an advance or an opening adjustment still appears in the accoun
 `BalanceType` column decides which side an opening balance falls on, so a supplier paid
 in advance, or a customer in credit, reads as money owed the other way.
 
-Because nothing is stored, nothing can go stale: every write re-reads the sheet, the
-party lists recompute their outstanding column on each render, and recording a payment
-from inside an account rebuilds that account straight away.
+Because nothing is stored, nothing can go stale: a write reads back the tabs it
+touched, the party lists recompute their outstanding column on each render, and
+recording a payment from inside an account rebuilds that account straight away.
 
 ### The party statement
 
@@ -235,6 +285,12 @@ the new modules.
    leaves the old code serving requests.
 5. On its first call the app runs `setup`, which creates any missing tab with its
    header row. It never deletes or rewrites existing rows.
+
+Deploying a new version is what turns on the narrowed reads and the post-write tabs in
+the transaction response. Until it is deployed the app still works: an older `Code.gs`
+ignores `sheets` and answers with every tab, which the app applies exactly as before,
+just without the speed-up. Nothing has to be deployed in a particular order — each side
+tolerates the other.
 
 Then set the deployment URL in `API_CONFIG.url` near the top of `index.html` if
 yours differs from the one in the repository.

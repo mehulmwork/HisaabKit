@@ -1141,8 +1141,15 @@ function isFirstVisit() {
      API.<action>()     one call to the Apps Script web app
      loadFromApi()      startup read of every tab, in one round trip
      refreshSheet()     re-read one tab
+     syncSheets()       re-read the named tabs, or every tab when none named
      repoCreate/repoUpdate/repoDelete   write-through helpers
      repoTransaction()  several writes applied as one unit
+
+   A write does not re-read the workbook. The transaction response carries the
+   tabs that batch wrote, as the sheet holds them, read under the same lock, so
+   the screen is showing what the sheet holds without a second round trip.
+   reconcileAfterWrite() applies those, and falls back to syncSheets() against
+   an older backend that does not send them.
 
    The sheet is the source of truth. localStorage keeps the last successful
    read so the app still opens when the network is down, and queues master-data
@@ -1155,6 +1162,97 @@ function isFirstVisit() {
    ---------------------------------------------------------------------- */
 
 const PENDING_KEY = 'hisabkit_pending';
+
+/**
+ * Lightweight timings, for development only.
+ *
+ * The counters are always kept — they are integer increments — because the
+ * test suites assert on them. The timed events are only recorded when the page
+ * is opened with ?perf=1 or the device sets localStorage.hisabkit_perf = '1',
+ * so a normal user pays nothing and sees no debugging UI.
+ *
+ *   HisabKitPerf.report()    counts per action, and the counters
+ *   HisabKitPerf.summary()   min / median / max milliseconds per label
+ *   HisabKitPerf.clear()
+ */
+const HisabKitPerf = {
+  enabled: false,
+  events: [],
+  counters: {
+    dumpFull: 0,        // dump with no "sheets" parameter — the whole workbook
+    dumpTargeted: 0,    // dump narrowed to the tabs a write touched
+    listCalls: 0,
+    transactionCalls: 0,
+    getCalls: 0
+  },
+
+  note(kind, meta) {
+    if (!this.enabled) return;
+    this.events.push(Object.assign({ kind: kind, t: Math.round(performance.now()) }, meta || {}));
+    if (this.events.length > 200) this.events.shift();
+  },
+
+  /** Time an async action and file it under a label. */
+  async measure(label, fn) {
+    const started = performance.now();
+    try {
+      return await fn();
+    } finally {
+      this.note('time', { label: label, ms: Math.round(performance.now() - started) });
+    }
+  },
+
+  summary() {
+    const groups = {};
+    this.events.filter(e => e.kind === 'time').forEach(e => {
+      (groups[e.label] = groups[e.label] || []).push(e.ms);
+    });
+
+    const out = {};
+    Object.keys(groups).forEach(label => {
+      const list = groups[label].slice().sort((a, b) => a - b);
+      out[label] = {
+        count: list.length,
+        min: list[0],
+        median: list[Math.floor(list.length / 2)],
+        max: list[list.length - 1]
+      };
+    });
+    return out;
+  },
+
+  report() {
+    const byAction = {};
+    this.events.filter(e => e.kind === 'api').forEach(e => {
+      const key = e.action + (e.sheets ? ' (' + e.sheets + ')' : '');
+      byAction[key] = (byAction[key] || 0) + 1;
+    });
+    return { counters: Object.assign({}, this.counters), byAction: byAction, events: this.events.slice() };
+  },
+
+  clear() {
+    this.events = [];
+    Object.keys(this.counters).forEach(k => { this.counters[k] = 0; });
+  }
+};
+
+window.HisabKitPerf = HisabKitPerf;
+
+try {
+  HisabKitPerf.enabled = /[?&]perf=1/.test(location.search) ||
+    localStorage.getItem('hisabkit_perf') === '1';
+} catch (err) {
+  HisabKitPerf.enabled = /[?&]perf=1/.test(location.search);
+}
+
+/**
+ * Requests already in flight, keyed by action + parameters.
+ *
+ * Two parts of the screen asking for the same thing at the same moment share
+ * one request instead of queueing two. Only reads are shared: two identical
+ * writes are two intents and must both reach the sheet.
+ */
+const inFlightReads = new Map();
 
 /** fetch() with an abort timeout, so a hung API cannot stall the app. */
 function apiFetch(url, options) {
@@ -1189,24 +1287,85 @@ const API = {
       .filter(k => params[k] !== undefined && params[k] !== null)
       .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
       .join('&');
-    const sep = API_CONFIG.url.indexOf('?') === -1 ? '?' : '&';
-    const url = API_CONFIG.url + sep + qs + '&_=' + Date.now();
-    console.log('[HisabKit API] GET ' + params.action + (params.sheet ? ' ' + params.sheet : ''));
 
-    const res = await apiFetch(url, { method: 'GET', redirect: 'follow', cache: 'no-store' });
-    return API.parse(res, 'GET ' + params.action);
+    // A read already on its way answers this one too. Keyed on the query
+    // without the cache-buster, so the same question collapses to one request.
+    if (inFlightReads.has(qs)) return inFlightReads.get(qs);
+
+    const pending = API.runGet(qs, params).finally(() => inFlightReads.delete(qs));
+    inFlightReads.set(qs, pending);
+    return pending;
   },
 
-  /** POST a JSON envelope. Sent as text/plain to stay a CORS simple request. */
+  /** The actual GET, shared by every caller that asked for the same thing. */
+  async runGet(qs, params) {
+    const sep = API_CONFIG.url.indexOf('?') === -1 ? '?' : '&';
+    const url = API_CONFIG.url + sep + qs + '&_=' + Date.now();
+    console.log('[HisabKit API] GET ' + params.action +
+      (params.sheet ? ' ' + params.sheet : '') +
+      (params.sheets ? ' [' + params.sheets + ']' : ''));
+
+    if (params.action === 'dump') {
+      if (params.sheets) HisabKitPerf.counters.dumpTargeted++;
+      else HisabKitPerf.counters.dumpFull++;
+    }
+    if (params.action === 'list') HisabKitPerf.counters.listCalls++;
+    if (params.action === 'get') HisabKitPerf.counters.getCalls++;
+
+    const started = performance.now();
+    try {
+      const res = await apiFetch(url, { method: 'GET', redirect: 'follow', cache: 'no-store' });
+      const data = await API.parse(res, 'GET ' + params.action);
+      HisabKitPerf.note('api', {
+        action: params.action, sheet: params.sheet, sheets: params.sheets,
+        ms: Math.round(performance.now() - started)
+      });
+      return data;
+    } catch (err) {
+      // A request that never reached the API — offline, blocked or timed out —
+      // has no reply to report, so say so here rather than failing silently.
+      console.error('[HisabKit API] GET ' + params.action + ' did not complete —',
+        err && err.message ? err.message : err);
+      HisabKitPerf.note('api', {
+        action: params.action, sheet: params.sheet, sheets: params.sheets,
+        ms: Math.round(performance.now() - started), failed: true
+      });
+      throw err;
+    }
+  },
+
+  /**
+   * A write, sent as a JSON envelope over text/plain to stay a CORS simple
+   * request. Two identical posts are two separate intentions — a purchase and
+   * the same purchase again — so writes are never shared, only reads are.
+   */
   async post(body) {
     console.log('[HisabKit API] POST ' + body.action + (body.sheet ? ' ' + body.sheet : ''));
-    const res = await apiFetch(API_CONFIG.url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(body),
-      redirect: 'follow'
-    });
-    return API.parse(res, 'POST ' + body.action);
+    if (body.action === 'transaction') HisabKitPerf.counters.transactionCalls++;
+
+    const started = performance.now();
+    try {
+      const res = await apiFetch(API_CONFIG.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(body),
+        redirect: 'follow'
+      });
+      const data = await API.parse(res, 'POST ' + body.action);
+      HisabKitPerf.note('api', {
+        action: 'POST ' + body.action, sheet: body.sheet,
+        ms: Math.round(performance.now() - started)
+      });
+      return data;
+    } catch (err) {
+      console.error('[HisabKit API] POST ' + body.action + ' did not complete —',
+        err && err.message ? err.message : err);
+      HisabKitPerf.note('api', {
+        action: 'POST ' + body.action, sheet: body.sheet,
+        ms: Math.round(performance.now() - started), failed: true
+      });
+      throw err;
+    }
   },
 
   /** Unwrap the { success, data } envelope, or throw with the API's reason. */
@@ -1242,7 +1401,16 @@ const API = {
   update(sheet, idField, id, data) { return API.post({ action: 'update', sheet: sheet, idField: idField, id: id, data: data }); },
   remove(sheet, idField, id)  { return API.post({ action: 'delete', sheet: sheet, idField: idField, id: id }); },
   transaction(ops)            { return API.post({ action: 'transaction', ops: ops }); },
-  dump()                      { return API.getQuery({ action: 'dump' }); },
+  /**
+   * Read tabs. With no argument, every tab, as before. With a list of sheet
+   * names, only those — what a write needs to re-read. A backend that predates
+   * the "sheets" parameter ignores it and answers with everything, which the
+   * applier handles the same way.
+   */
+  dump(sheets) {
+    const list = Array.isArray(sheets) ? sheets.filter(Boolean) : (sheets ? [sheets] : []);
+    return API.getQuery({ action: 'dump', sheets: list.length ? list.join(',') : undefined });
+  },
   meta()                      { return API.getQuery({ action: 'meta' }); },
   setup()                     { return API.getQuery({ action: 'setup' }); }
 };
@@ -1683,6 +1851,12 @@ function ensureOpeningLedger() {
   const opening = [];
   const corrections = [];
 
+  // Drop the bridging rows an earlier pass left behind. They are derived, so
+  // rebuilding them from scratch is the only correct thing to do: leaving one
+  // in place while a partial read updates the item's stock would let the same
+  // gap be counted twice, and stock is read back out of the ledger.
+  state.ledger = state.ledger.filter(l => !l.local);
+
   state.items.forEach(item => {
     const mine = state.ledger.filter(l => l.itemId === item.id);
     const net = round2(mine.reduce((total, row) => total + ledgerDelta(row), 0));
@@ -1816,16 +1990,115 @@ async function refreshSheet(sheetName) {
 }
 
 /**
- * Re-read every tab in one call, after a purchase, sale or payment has been
- * written. The screen then shows exactly what the sheet holds, rather than
- * what the app thinks it wrote.
+ * A tab together with the tabs its rows are meaningless without.
+ *
+ * A bill's lines live in Purchase_Items and are hung off the bill while the
+ * rows are applied, so re-reading Purchases on its own rebuilds every bill
+ * with no lines on it. Closing the set over those dependencies here means no
+ * call site has to remember it.
  */
-async function syncAll() {
-  await flushPendingWrites();
-  const dump = await API.dump();
-  applySheetData(dump);
+const SHEET_DEPENDENCIES = {
+  Purchases: ['Purchase_Items'],
+  Sales: ['Sales_Items']
+};
+
+function closeSheetSet(names) {
+  const out = new Set();
+  (names || []).forEach(name => {
+    out.add(name);
+    (SHEET_DEPENDENCIES[name] || []).forEach(dep => out.add(dep));
+  });
+  return Array.from(out);
+}
+
+/**
+ * Re-read the named tabs, or every tab when none are named, then apply them.
+ * Reading only what changed is what stops a save from waiting on the whole
+ * workbook.
+ */
+async function syncSheets(names) {
+  const flushed = await flushPendingWrites();
+  const want = names && names.length ? closeSheetSet(names.concat(flushed)) : null;
+  const data = await API.dump(want || undefined);
+  applySheetData(data);
   state.lastSync = new Date().toISOString();
-  return dump;
+  state.apiOnline = true;
+  state.apiError = '';
+  return data;
+}
+
+/**
+ * Bring state up to date after a write that has already succeeded.
+ *
+ * The transaction response carries the tabs that batch wrote, as the sheet
+ * holds them now, read under the same lock — so on a current backend this
+ * costs no round trip at all. Against an older backend, which does not send
+ * them, the same tabs are re-read instead.
+ */
+async function reconcileAfterWrite(response, touched) {
+  if (response && response.sheets && Object.keys(response.sheets).length) {
+    applySheetData(response.sheets);
+    state.lastSync = new Date().toISOString();
+    state.apiOnline = true;
+    state.apiError = '';
+    return response.sheets;
+  }
+  return syncSheets(touched);
+}
+
+/**
+ * How old the copy of the sheet held in memory may be before a form that
+ * commits money re-reads the lists it validates against.
+ */
+const MONEY_WRITE_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Make the lists a bill or an invoice is about to be validated against current
+ * — but only when they are actually stale, so opening one of these forms
+ * normally costs no round trip at all.
+ *
+ * Available stock is checked on screen before an invoice is written, and a
+ * payment is checked against the balance on the bill, so those two figures are
+ * worth a read before the user commits to them rather than after.
+ */
+async function ensureFreshBeforeMoneyWrite(names) {
+  const at = state.lastSync ? Date.parse(state.lastSync) : 0;
+  if (at && Date.now() - at < MONEY_WRITE_MAX_AGE_MS) return false;
+
+  setBusy(true, 'Checking Google Sheets…');
+  try {
+    await syncSheets(names);
+    return true;
+  } catch (err) {
+    console.warn('[HisabKit] freshness check failed — continuing with what is loaded', err);
+    state.apiOnline = false;
+    state.apiError = describeApiError(err, 'Could not check Google Sheets.');
+    return false;
+  } finally {
+    setBusy(false);
+  }
+}
+
+/**
+ * Refresh after a write that has already succeeded, and never let a refresh
+ * problem read as a save failure.
+ *
+ * The row is in the sheet at this point. Telling the user the save failed when
+ * only the re-read failed is how the same bill gets entered twice, so a failed
+ * refresh is reported for what it is: what is on screen may be out of date.
+ */
+async function refreshAfterWrite(response, touched) {
+  try {
+    await reconcileAfterWrite(response, touched);
+    clearSyncBanner();
+    return true;
+  } catch (err) {
+    console.error('[HisabKit] saved, but the screen could not be refreshed', err);
+    state.apiOnline = false;
+    state.apiError = describeApiError(err, 'Saved, but the screen could not be refreshed.');
+    showSyncBanner(state.apiError + ' — the figures shown may be out of date.');
+    return false;
+  }
 }
 
 /* ---- write-through helpers ---- */
@@ -1918,13 +2191,17 @@ function queueWrite(entry) {
   writePending(list);
 }
 
-/** Push anything created or edited while the sheet was unreachable. */
+/**
+ * Push anything created or edited while the sheet was unreachable.
+ * Returns the tabs it managed to write, so the caller can re-read those too.
+ */
 async function flushPendingWrites() {
   const list = readPending();
-  if (!list.length) return;
+  if (!list.length) return [];
 
   console.log('[HisabKit API] pushing ' + list.length + ' change(s) saved while offline');
   const remaining = [];
+  const written = [];
 
   for (const entry of list) {
     try {
@@ -1933,6 +2210,7 @@ async function flushPendingWrites() {
       } else if (entry.action === 'update') {
         await API.update(entry.sheet, SHEETS[entry.sheet].idField, entry.id, entry.data);
       }
+      written.push(entry.sheet);
     } catch (err) {
       console.warn('[HisabKit API] still offline — ' + entry.sheet + ' change kept for later', err);
       remaining.push(entry);
@@ -1943,6 +2221,7 @@ async function flushPendingWrites() {
   if (remaining.length !== list.length) {
     showToast((list.length - remaining.length) + ' offline change(s) synced to Google Sheets');
   }
+  return written;
 }
 /* ============================================================
    5. TOAST NOTIFICATIONS, BUSY INDICATOR, SYNC BANNER
@@ -2610,14 +2889,16 @@ async function savePurchase(form) {
 
   if (paid > 0) ops.push(settlementOp('purchase', purchase, 'billNumber'));
 
+  let saved;
   try {
-    await repoTransaction(ops);
-    await syncAll();
-    return { ok: true, purchase };
+    saved = await repoTransaction(ops);
   } catch (err) {
     console.error('[HisabKit] purchase save failed', err);
     return { ok: false, message: describeApiError(err, 'Purchase could not be saved.') };
   }
+
+  await refreshAfterWrite(saved, ['Purchases', 'Items', 'Stock_Ledger'].concat(paid > 0 ? ['Payments'] : []));
+  return { ok: true, purchase };
 }
 
 /* ---- Sales ---- */
@@ -2707,14 +2988,16 @@ async function saveSale(form) {
 
   if (paid > 0) ops.push(settlementOp('sale', sale, 'invoiceNumber'));
 
+  let saved;
   try {
-    await repoTransaction(ops);
-    await syncAll();
-    return { ok: true, sale };
+    saved = await repoTransaction(ops);
   } catch (err) {
     console.error('[HisabKit] sale save failed', err);
     return { ok: false, message: describeApiError(err, 'Invoice could not be saved.') };
   }
+
+  await refreshAfterWrite(saved, ['Sales', 'Items', 'Stock_Ledger'].concat(paid > 0 ? ['Payments'] : []));
+  return { ok: true, sale };
 }
 
 /**
@@ -2757,14 +3040,16 @@ async function recordSettlement(kind, docId, amount, paymentMode, date) {
     } }
   ];
 
+  let saved;
   try {
-    await repoTransaction(ops);
-    await syncAll();
-    return { ok: true };
+    saved = await repoTransaction(ops);
   } catch (err) {
     console.error('[HisabKit] settlement failed', err);
     return { ok: false, message: describeApiError(err, 'The payment could not be recorded.') };
   }
+
+  await refreshAfterWrite(saved, [buying ? 'Purchases' : 'Sales', 'Payments']);
+  return { ok: true };
 }
 
 /* ---- Dashboard roll-ups ---- */
@@ -4099,8 +4384,13 @@ function renderLedger() {
  * kind: 'purchase' | 'sale'
  * options: { id } to edit-in-place is not supported in Phase 1 — new only.
  */
-function openTransactionForm(kind) {
+async function openTransactionForm(kind) {
   const isPurchase = kind === 'purchase';
+
+  // Available stock and the party this is billed to are validated against the
+  // lists in memory, so make them current first when they have gone stale.
+  await ensureFreshBeforeMoneyWrite(isPurchase ? ['Suppliers', 'Items'] : ['Customers', 'Items']);
+
   const title       = isPurchase ? 'Add Purchase' : 'New Sales Invoice';
   const partyLabel  = isPurchase ? 'Supplier' : 'Customer';
   const partyKind   = isPurchase ? 'supplier' : 'customer';
@@ -4848,15 +5138,18 @@ function confirmDeletePurchase(id) {
 
       ops.push({ action: 'delete', sheet: 'Purchases', id: p.id });
 
+      let saved;
       try {
-        await repoTransaction(ops);
-        await syncAll();
-        renderPurchaseBills();
-        showToast('Purchase deleted and stock returned');
+        saved = await repoTransaction(ops);
       } catch (err) {
         console.error('[HisabKit] purchase delete failed', err);
         showToast(describeApiError(err, 'The purchase could not be deleted.'), 'error');
+        return;
       }
+
+      await refreshAfterWrite(saved, ['Purchases', 'Items', 'Stock_Ledger', 'Payments']);
+      renderPurchaseBills();
+      showToast('Purchase deleted and stock returned');
     }
   });
 }
@@ -5168,15 +5461,18 @@ function confirmDeleteSale(id) {
 
       ops.push({ action: 'delete', sheet: 'Sales', id: s.id });
 
+      let saved;
       try {
-        await repoTransaction(ops);
-        await syncAll();
-        renderSales();
-        showToast('Invoice deleted and stock returned');
+        saved = await repoTransaction(ops);
       } catch (err) {
         console.error('[HisabKit] invoice delete failed', err);
         showToast(describeApiError(err, 'The invoice could not be deleted.'), 'error');
+        return;
       }
+
+      await refreshAfterWrite(saved, ['Sales', 'Items', 'Stock_Ledger', 'Payments']);
+      renderSales();
+      showToast('Invoice deleted and stock returned');
     }
   });
 }
@@ -7067,8 +7363,12 @@ function renderPayments() {
  * user having to find the party again. onSaved replaces the default
  * close-and-rerender, so the caller can refresh whatever view is underneath.
  */
-function openPaymentForm(opts) {
+async function openPaymentForm(opts) {
   const options = opts || {};
+
+  // The party dropdown and the balance a payment is checked against come from
+  // the lists in memory, so make them current first when they have gone stale.
+  await ensureFreshBeforeMoneyWrite(['Suppliers', 'Customers', 'Payments']);
   const body = `
     <form id="pmtForm" novalidate>
       <div class="form-grid">
@@ -7257,14 +7557,16 @@ async function savePayment(fields) {
     ops.push({ action: 'update', sheet: buying ? 'Purchases' : 'Sales', id: doc.id, data: updated });
   }
 
+  let saved;
   try {
-    await repoTransaction(ops);
-    await syncAll();
-    return { ok: true };
+    saved = await repoTransaction(ops);
   } catch (err) {
     console.error('[HisabKit] payment save failed', err);
     return { ok: false, message: describeApiError(err, 'Payment could not be saved.') };
   }
+
+  await refreshAfterWrite(saved, fields.referenceId ? ['Payments', buying ? 'Purchases' : 'Sales'] : ['Payments']);
+  return { ok: true };
 }
 
 function confirmDeletePayment(id) {
@@ -7297,15 +7599,20 @@ function confirmDeletePayment(id) {
         });
       }
 
+      let saved;
       try {
-        await repoTransaction(ops);
-        await syncAll();
-        render();
-        showToast('Payment deleted successfully');
+        saved = await repoTransaction(ops);
       } catch (err) {
         console.error('[HisabKit] payment delete failed', err);
         showToast(describeApiError(err, 'The payment could not be deleted.'), 'error');
+        return;
       }
+
+      await refreshAfterWrite(saved, p.referenceType === 'Purchase' || p.referenceType === 'Sale'
+        ? ['Payments', p.referenceType === 'Purchase' ? 'Purchases' : 'Sales']
+        : ['Payments']);
+      render();
+      showToast('Payment deleted successfully');
     }
   });
 }
@@ -7347,17 +7654,22 @@ async function saveSettings(values) {
     }
   });
 
+  let saved;
   try {
-    await repoTransaction(ops);
-    await syncAll();
-    state.settings = Object.assign({}, state.settings, values);
-    state.settings.lowStockAlert = cellBool(state.settings.lowStockAlert);
-    state.settings.taxEnabled = cellBool(state.settings.taxEnabled);
-    return { ok: true };
+    saved = await repoTransaction(ops);
   } catch (err) {
     console.error('[HisabKit] settings save failed', err);
     return { ok: false, message: describeApiError(err, 'Settings could not be saved.') };
   }
+
+  // Settings is one tab and the values just written are known, so this needs
+  // no re-read at all — the response is applied and the merge below keeps the
+  // booleans in their app shape.
+  await refreshAfterWrite(saved, ['Settings']);
+  state.settings = Object.assign({}, state.settings, values);
+  state.settings.lowStockAlert = cellBool(state.settings.lowStockAlert);
+  state.settings.taxEnabled = cellBool(state.settings.taxEnabled);
+  return { ok: true };
 }
 
 /** One input for a setting, shaped by what the setting holds. */
@@ -7644,7 +7956,15 @@ function render() {
   }
 }
 
+let globalEventsBound = false;
+
 function bindGlobalEvents() {
+  // init() runs again when the local cache is cleared, and these bindings live
+  // on containers that survive a re-render — so binding twice would fire every
+  // navigation twice and keep doing so after each clear.
+  if (globalEventsBound) return;
+  globalEventsBound = true;
+
   // Sidebar navigation (delegated — the sidebar re-renders often)
   document.getElementById('sidebar').addEventListener('click', e => {
     const routeBtn = e.target.closest('[data-route]');

@@ -188,7 +188,7 @@ function route(params, body) {
     case 'setup':
       return ok(setupAll());
     case 'dump':
-      return ok(dumpAll());
+      return ok(dumpAll(req));
     case 'list':
       return ok(list(req));
     case 'get':
@@ -208,12 +208,36 @@ function route(params, body) {
 }
 
 /**
- * Every tab in one response, so the frontend can start with a single round
- * trip instead of eleven. A tab that does not exist yet comes back empty.
+ * Tabs in one response, so the frontend can start with a single round trip
+ * instead of eleven. A tab that does not exist yet comes back empty.
+ *
+ * "sheets" narrows the response to the tabs named, comma-separated, which is
+ * what the frontend asks for after a write: the few tabs that write touched,
+ * rather than the whole workbook. Without it every tab is returned, exactly as
+ * before, so an older frontend is unaffected.
  */
-function dumpAll() {
+function dumpAll(req) {
+  var wanted = null;
+  var raw = req && req.sheets;
+
+  if (Array.isArray(raw)) {
+    wanted = raw.map(function (s) { return String(s).trim(); }).filter(Boolean);
+  } else if (raw && String(raw).trim()) {
+    wanted = String(raw).split(',').map(function (s) { return String(s).trim(); }).filter(Boolean);
+  }
+
+  if (wanted && wanted.length) {
+    wanted.forEach(function (name) {
+      if (!SCHEMA[name]) {
+        throw new Error('Sheet "' + name + '" is not allowed. Allowed: ' + Object.keys(SCHEMA).join(', '));
+      }
+    });
+  } else {
+    wanted = Object.keys(SCHEMA);
+  }
+
   var out = {};
-  Object.keys(SCHEMA).forEach(function (name) {
+  wanted.forEach(function (name) {
     var sheet = openSheet(name, false);
     out[name] = sheet ? readRecords(sheet) : [];
   });
@@ -447,7 +471,17 @@ function transaction(req) {
       throw new Error('Nothing was saved — ' + err.message);
     }
 
-    return { applied: results.length, results: results };
+    // Hand back every tab the batch wrote, as the sheet now holds it. The
+    // frontend shows the write from this instead of spending a second round
+    // trip re-reading, and because it is read under the same lock it is
+    // exactly the state the save produced. An older frontend ignores it.
+    var written = {};
+    Object.keys(touched).forEach(function (name) {
+      var sheet = openSheet(name, false);
+      written[name] = sheet ? readRecords(sheet) : [];
+    });
+
+    return { applied: results.length, results: results, sheets: written };
   } finally {
     lock.releaseLock();
   }
