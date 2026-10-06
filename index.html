@@ -1923,8 +1923,21 @@ function applySheetData(data) {
     state.suppliers = (data.Suppliers || []).map(r => partyFromRow('supplier', r)).filter(p => p.name);
   }
 
+  // A bill's lines live in another tab, so a read that carries one without the
+  // other has to be handled with care: rebuilding the bill from its header
+  // alone would leave every bill with no lines on it. Recording a payment
+  // touches the bill's header and nothing else, so that is the common case —
+  // the lines already held for a bill are kept, and the tab that owns them
+  // replaces them whenever it does arrive.
   if (has('Purchases')) {
+    const heldLines = {};
+    state.purchases.forEach(p => { heldLines[p.id] = p.items; });
+
     state.purchases = (data.Purchases || []).map(purchaseFromRow).filter(p => p.id || p.billNumber);
+
+    if (!has('Purchase_Items')) {
+      state.purchases.forEach(p => { if (heldLines[p.id]) p.items = heldLines[p.id]; });
+    }
   }
   if (has('Purchase_Items')) {
     const lines = (data.Purchase_Items || []).map(r => lineFromRow('purchase', r));
@@ -1932,7 +1945,14 @@ function applySheetData(data) {
   }
 
   if (has('Sales')) {
+    const heldLines = {};
+    state.sales.forEach(s => { heldLines[s.id] = s.items; });
+
     state.sales = (data.Sales || []).map(saleFromRow).filter(s => s.id || s.invoiceNumber);
+
+    if (!has('Sales_Items')) {
+      state.sales.forEach(s => { if (heldLines[s.id]) s.items = heldLines[s.id]; });
+    }
   }
   if (has('Sales_Items')) {
     const lines = (data.Sales_Items || []).map(r => lineFromRow('sale', r));
@@ -5003,7 +5023,7 @@ function openViewPurchase(id) {
         <div class="detail-item"><span class="k">Supplier</span><span class="v">${escapeHtml(supplierName(p.supplierId))}</span></div>
         <div class="detail-item"><span class="k">Bill Number</span><span class="v mono">${escapeHtml(p.billNumber)}</span></div>
         <div class="detail-item"><span class="k">Bill Date</span><span class="v">${formatDate(p.date)}</span></div>
-        <div class="detail-item"><span class="k">Payment Type</span><span class="v">${escapeHtml(p.paymentType)}</span></div>
+        <div class="detail-item"><span class="k">Payment Status</span><span class="v">${escapeHtml(p.paymentStatus)}</span></div>
       </div>
 
       <div class="section-title">Items</div>
@@ -5331,7 +5351,7 @@ function openViewSale(id) {
         <div class="detail-item"><span class="k">Customer</span><span class="v">${escapeHtml(customerName(s.customerId))}</span></div>
         <div class="detail-item"><span class="k">Invoice Number</span><span class="v mono">${escapeHtml(s.invoiceNumber)}</span></div>
         <div class="detail-item"><span class="k">Invoice Date</span><span class="v">${formatDate(s.date)}</span></div>
-        <div class="detail-item"><span class="k">Payment Type</span><span class="v">${escapeHtml(s.paymentType)}</span></div>
+        <div class="detail-item"><span class="k">Payment Status</span><span class="v">${escapeHtml(s.paymentStatus)}</span></div>
       </div>
 
       <div class="section-title">Items</div>
